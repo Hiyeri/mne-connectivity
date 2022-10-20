@@ -430,7 +430,7 @@ class _MIMEst(_MultivarCohEstBase):
                     E = self.mim_mic_compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[1])
 
                     # Equation 14
-                    self.con_scores[node_i, freq_i] = np.trace(np.matmul(E, np.conj(E).T))
+                    self.con_scores[node_i, freq_i, time_i] = np.trace(np.matmul(E, np.conj(E).T))
             node_i += 1
         self.reshape_con_scores()
 
