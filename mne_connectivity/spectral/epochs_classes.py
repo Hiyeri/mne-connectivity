@@ -563,6 +563,7 @@ class _MIMEst(_MultivarCohEstBase):
         csd = self.reshape_csd()/n_epochs
         n_times = csd.shape[0]
         for con_i, seed_idcs, target_idcs in zip(np.arange(len(seeds)), seeds, targets):
+            n_seeds = len(seed_idcs)
             con_idcs = [*seed_idcs, *target_idcs]
             con_csd = csd[np.ix_(np.arange(n_times), np.arange(self.n_freqs), con_idcs, con_idcs)]
             for freq_i in range(self.n_freqs):
