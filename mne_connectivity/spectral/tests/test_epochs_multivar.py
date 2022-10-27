@@ -1,295 +1,362 @@
+"""Test frequency-domain multivariate connectivity methods."""
+import mne
 import numpy as np
-from numpy.testing import (
-    assert_allclose, 
-    assert_array_almost_equal,
-    assert_array_less
-    )
 import pytest
-
-from mne_connectivity import (
-    SpectralConnectivity, 
-    multivar_spectral_connectivity_epochs
-    )
-from mne_connectivity.spectral.epochs import _CohEst, _get_n_epochs
-
-from .test_spectral import create_test_dataset
+from mne.filter import filter_data
+from mne_connectivity import (SpectralConnectivity,
+                              multivar_spectral_connectivity_epochs)
+from numpy.testing import assert_array_almost_equal, assert_array_less
 
 
-@pytest.mark.parametrize('method', [
-    'mic', 'mim', ['mic', 'mim']])
-@pytest.mark.parametrize('mode', ['multitaper', 'fourier', 'cwt_morlet'])
-def test_multivar_spectral_connectivity(method, mode):
-    """Test frequency-domain multivariate connectivity methods."""
+def create_test_dataset_multivar(sfreq, n_signals, n_epochs, n_times, tmin, tmax,
+                        fstart, fend, trans_bandwidth=2., shift=None):
+    """Create test dataset with no spurious correlations.
+
+    Parameters
+    ----------
+    sfreq : float
+        The simulated data sampling rate.
+    n_signals : int
+        The number of channels/signals to simulate.
+    n_epochs : int
+        The number of Epochs to simulate.
+    n_times : int
+        The number of time points at which the Epoch data is "sampled".
+    tmin : int
+        The start time of the Epoch data.
+    tmax : int
+        The end time of the Epoch data.
+    fstart : int
+        The frequency at which connectivity starts. The lower end of the
+        spectral connectivity.
+    fend : int
+        The frequency at which connectivity ends. The upper end of the
+        spectral connectivity.
+    trans_bandwidth : int, optional
+        The bandwidth of the filtering operation, by default 2.
+    shift : int, optional
+        Shift the correlated signal by a given number of samples, by default 
+        None.
+
+    Returns
+    -------
+    data : np.ndarray of shape (n_epochs, n_signals, n_times)
+        The epoched dataset.
+    times_data : np.ndarray of shape (n_times, )
+        The times at which each sample of the ``data`` occurs at.
+    """
+    # Use a case known to have no spurious correlations (it would bad if
+    # tests could randomly fail):
+    rng = np.random.RandomState(0)
+
+    data = rng.randn(n_signals, n_epochs * n_times)
+    times_data = np.linspace(tmin, tmax, n_times)
+
+    # simulate connectivity from fstart to fend
+    data[1, :] = filter_data(data[0, :], sfreq, fstart, fend,
+                             filter_length='auto', fir_design='firwin2',
+                             l_trans_bandwidth=trans_bandwidth,
+                             h_trans_bandwidth=trans_bandwidth)
+    if shift is not None:
+        data[1, :] = np.roll(data[1,:], shift=shift)
+
+    # add some noise, so the spectrum is not exactly zero
+    data[1, :] += 1e-2 * rng.randn(n_times * n_epochs)
+    data = data.reshape(n_signals, n_epochs, n_times)
+    data = np.transpose(data, [1, 0, 2])
+    return data, times_data
+
+
+class TestMultivarSpectralConnectivity:
     sfreq = 50.
-    n_signals = 9
+    n_signals = 4
     n_epochs = 8
     n_times = 256
     trans_bandwidth = 2.
     tmin = 0.
     tmax = (n_times - 1) / sfreq
+    fstart = 5.0
+    fend = 15.0
+    test_data, test_times = create_test_dataset_multivar(
+                sfreq, n_signals=n_signals, n_epochs=n_epochs, 
+                n_times=n_times, tmin=tmin, tmax=tmax, 
+                fstart=fstart, fend=fend, 
+                trans_bandwidth=trans_bandwidth, shift=None
+                )
 
-    # 5Hz..15Hz
-    fstart, fend = 5.0, 15.0
-    data, times_data = create_test_dataset(
-        sfreq, n_signals=n_signals, n_epochs=n_epochs, n_times=n_times,
-        tmin=tmin, tmax=tmax,
-        fstart=fstart, fend=fend, trans_bandwidth=trans_bandwidth)
+    def test_invalid_method_or_mode(self):      
+        class _InvalidClass:
+            pass
 
-    class _InvalidClass:
-        pass
+        with pytest.raises(
+            ValueError, 
+            match='is not a valid connectivity method'
+            ):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), method='notamethod'
+                )
 
-    # First we test some invalid parameters:
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs,
-                  data, method='notamethod', 
-                  match='is not a valid connectivity method')
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs,
-                  data, method=_InvalidClass, 
-                  match='The supplied connectivity method does not have the method')
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs, data,
-                  mode='notamode', match='mode has an invalid value')
+        with pytest.raises(
+            ValueError, 
+            match='The supplied connectivity method does not have the method'
+            ):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), method=_InvalidClass,
+                )
 
-    # test invalid fmin fmax settings
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs, data, fmin=10,
-                  fmax=10 + 0.5 * (sfreq / float(n_times)), 
-                  method='There are no frequency points between')
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs,
-                  data, fmin=10, fmax=5, method='fmax must be larger than fmin')
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs, data, fmin=(0, 11),
-                  fmax=(5, 10), method='fmax must be larger than fmin')
-    pytest.raises(ValueError, multivar_spectral_connectivity_epochs, data, fmin=(11,),
-                  fmax=(12, 15), 
-                  method='fmin and fmax must have the same length')
+        with pytest.raises(
+            ValueError, 
+            match='mode has an invalid value'
+            ):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), mode='notamode'
+                )
 
-    # define some frequencies for cwt
-    cwt_freqs = np.arange(3, 24.5, 1)
+    def test_invalid_fmin_or_fmax(self):
 
-    if method == 'mic' and mode == 'multitaper':
-        # only check adaptive estimation for coh to reduce test time
-        check_adaptive = [False, True]
-    else:
-        check_adaptive = [False]
+        with pytest.raises(
+            ValueError, 
+            match='There are no frequency points between'
+            ):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), fmin=10,
+                fmax=10 + 0.5 * (self.sfreq / float(self.n_times))
+                )
 
-    if method == 'mic' and mode == 'cwt_morlet':
-        # so we also test using an array for num cycles
-        cwt_n_cycles = 7. * np.ones(len(cwt_freqs))
-    else:
-        cwt_n_cycles = 7.
+        with pytest.raises(ValueError, match='fmax must be larger than fmin'):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), fmin=10, fmax=5
+                )
 
+        with pytest.raises(ValueError, match='fmax must be larger than fmin'):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, 
+                indices=([[0,2]], [[1,3]]), fmin=(0, 11), fmax=(5, 10)
+                )
 
-    for adaptive in check_adaptive:
+        with pytest.raises(
+            ValueError, 
+            match='fmin and fmax must have the same length'
+            ):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), fmin=(11,), 
+                fmax=(12, 15)
+                )
 
-        if adaptive:
+    def test_invalid_indices(self):
+        # Indices cannot be None
+        with pytest.raises(
+            ValueError, match='indices must be specified'):
+            multivar_spectral_connectivity_epochs(self.test_data, indices=None)
+
+    def test_n_seed_or_target_components(self):
+
+        # Check 1 seed, 1 target component
+        _ = multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+            n_seed_components=(1,), n_target_components=(1,)
+            )
+
+        # Check 2 seed, 2 target components
+        _ = multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+            n_seed_components=(2,), n_target_components=(2,)
+            )
+
+        # Check too many seed components
+        with pytest.raises(ValueError, 
+            match="The number of components to take"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=(3,), n_target_components=(2,)
+                )
+
+        # Check to many target components
+        with pytest.raises(ValueError, 
+            match="The number of components to take"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=(2,), n_target_components=(3,)
+                )
+
+        # Check wrong length of n_seed_components
+        with pytest.raises(ValueError,
+            match="n_seed_components must have the same length as"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=(2, 2), n_target_components=(2,)
+                )
+
+        # Check wrong length of n_target_components
+        with pytest.raises(ValueError,
+            match="n_target_components must have the same length as"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=(2,), n_target_components=(2, 2)
+                )
+
+        # Check n_seed_components is not a tuple or None
+        with pytest.raises(ValueError,
+            match="n_seed_components must be a tuple or None"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=2, n_target_components=(2,)
+                )
+        
+        # Check n_seed_components is not a tuple or None
+        with pytest.raises(ValueError,
+            match="n_target_components must be a tuple or None"):
+            multivar_spectral_connectivity_epochs(
+                self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+                n_seed_components=(2,), n_target_components=2
+                )
+
+    @pytest.mark.parametrize('mt_adaptive', [True, False])
+    @pytest.mark.parametrize('mt_low_bias', [True, False])
+    def test_adaptive(self, mt_adaptive, mt_low_bias):
+        if mt_adaptive:
             mt_bandwidth = 1.
-        else:
+        else: 
             mt_bandwidth = None
+        multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0]], [[1]]), method='mic', 
+            mode='multitaper',sfreq=self.sfreq, mt_adaptive=mt_adaptive, 
+            mt_low_bias=mt_low_bias, mt_bandwidth=mt_bandwidth)
 
-        # indices cannot be None
-        pytest.raises(ValueError, multivar_spectral_connectivity_epochs,
-            data, method=method, mode=mode, indices=None, sfreq=sfreq,
-            mt_adaptive=adaptive, mt_low_bias=True,
-            mt_bandwidth=mt_bandwidth, cwt_freqs=cwt_freqs,
-            cwt_n_cycles=cwt_n_cycles, match='Please put the matching string here')
 
-        indices = ([[0, 1, 2], [3, 4, 5]], [[6, 7, 8], [6, 7, 8]])
+    @pytest.mark.parametrize('method', ['mic', 'mim', ['mic', 'mim']])
+    @pytest.mark.parametrize('mode', ['multitaper', 'fourier', 'cwt_morlet'])
+    def test_methods_and_modes(self, method, mode):
+        # define some frequencies for cwt
+        cwt_freqs = np.arange(3, 24.5, 1)
+        if method == 'mic' and mode == 'cwt_morlet':
+            # so we also test using an array for num cycles
+            cwt_n_cycles = 7 * np.ones(len(cwt_freqs))
+        else:
+            cwt_n_cycles = 7
+
         con = multivar_spectral_connectivity_epochs(
-            data, method=method, mode=mode, indices=indices, sfreq=sfreq,
-            mt_adaptive=adaptive, mt_low_bias=True,
-            mt_bandwidth=mt_bandwidth, cwt_freqs=cwt_freqs,
-            cwt_n_cycles=cwt_n_cycles)
+            self.test_data, indices=([[0]], [[1]]), method=method, mode=mode,
+            sfreq=self.sfreq, cwt_freqs=cwt_freqs,
+            cwt_n_cycles=cwt_n_cycles
+            )
 
-        if isinstance(method, list):
-            this_con = con[0]
-        else:
-            this_con = con
-        freqs = this_con.attrs.get('freqs_used')
-        n = this_con.n_epochs_used
-        if isinstance(this_con, SpectralConnectivity):
-            times = this_con.attrs.get('times_used')
-        else:
-            times = this_con.times
+        if not isinstance(method, list):
+            freqs = con.attrs.get('freqs_used')
+            n = con.n_epochs_used
+            if isinstance(con, SpectralConnectivity):
+                times = con.attrs.get('times_used')
+            else:
+                times = con.times
 
-        assert (n == n_epochs)
-        assert_array_almost_equal(times_data, times)
+            assert (n == self.n_epochs)
+            assert_array_almost_equal(self.test_times, times)
 
-        if mode == 'multitaper':
-            upper_t = 0.95
+            upper_t = 0.3
             lower_t = 0.5
-        else:  # mode == 'fourier' or mode == 'cwt_morlet'
-            # other estimates have higher variance
-            upper_t = 0.8
-            lower_t = 0.75
 
-        # test the simulated signal
-        gidx = np.searchsorted(freqs, (fstart, fend))
-        bidx = np.searchsorted(freqs,
-                               (fstart - trans_bandwidth * 2,
-                                fend + trans_bandwidth * 2))
-        if method == 'coh':
-            assert np.all(
-                con.get_data(output='dense')[
-                    1, 0, gidx[0]:gidx[1]
-                ] > upper_t), \
-                con.get_data()[
-                    1, 0, gidx[0]:gidx[1]].min()
-            # we see something for zero-lag
+            # test the simulated signal
+            gidx = np.searchsorted(freqs, (self.fstart, self.fend))
+            bidx = np.searchsorted(
+                freqs,
+                (self.fstart - self.trans_bandwidth * 2, 
+                self.fend + self.trans_bandwidth * 2)
+                )
+            
+            # Check 0-lag, 2 signals
+            data, _ = create_test_dataset_multivar(
+                self.sfreq, n_signals=2, n_epochs=self.n_epochs,
+                n_times=self.n_times, tmin=self.tmin, tmax=self.tmax, 
+                fstart=self.fstart, fend=self.fend, 
+                trans_bandwidth=self.trans_bandwidth, shift=0
+            )
+            con = multivar_spectral_connectivity_epochs(
+                data, indices=([[0]], [[1]]), method=method, mode=mode, 
+                sfreq=self.sfreq, cwt_freqs=cwt_freqs,
+                cwt_n_cycles=cwt_n_cycles, n_seed_components=None, 
+                n_target_components=None
+                )
             assert_array_less(
-                con.get_data(output='dense')
-                [1, 0, :bidx[0]],
-                lower_t)
-            assert np.all(
-                con.get_data(output='dense')[1, 0, bidx[1]:] < lower_t), \
-                con.get_data()[1, 0, bidx[1:]].max()
-        elif method == 'cohy':
-            # imaginary coh will be zero
-            check = np.imag(con.get_data(output='dense')
-                            [1, 0, gidx[0]:gidx[1]])
-            assert np.all(check < lower_t), check.max()
-            # we see something for zero-lag
-            assert_array_less(
-                upper_t,
-                np.abs(con.get_data(output='dense')[
-                    1, 0, gidx[0]:gidx[1]
-                ]))
-            assert_array_less(
-                np.abs(con.get_data(output='dense')[1, 0, :bidx[0]]),
-                lower_t)
-            assert_array_less(
-                np.abs(con.get_data(output='dense')[1, 0, bidx[1]:]),
-                lower_t)
-        elif method == 'imcoh':
-            # imaginary coh will be zero
-            assert_array_less(
-                con.get_data(output='dense')[1, 0, gidx[0]:gidx[1]],
-                lower_t)
-            assert_array_less(
-                con.get_data(output='dense')[1, 0, :bidx[0]],
-                lower_t)
-            assert_array_less(
-                con.get_data(output='dense')[1, 0, bidx[1]:], lower_t),
-            assert np.all(
-                con.get_data(output='dense')[1, 0, bidx[1]:] < lower_t), \
-                con.get_data()[1, 0, bidx[1]:].max()
+                con.get_data(output='raveled')[ 0, :bidx[0]], lower_t
+                )
 
-        # compute a subset of connections using indices and 2 jobs
-        indices = (np.array([2, 1]), np.array([0, 0]))
+            # Check 1-lag, 4 signals
+            data, _ = create_test_dataset_multivar(
+                self.sfreq, n_signals=4, n_epochs=self.n_epochs, 
+                n_times=self.n_times, tmin=self.tmin, tmax=self.tmax, 
+                fstart=self.fstart, fend=self.fend, 
+                trans_bandwidth=self.trans_bandwidth, shift=1
+            )
 
-        if not isinstance(method, list):
-            test_methods = (method, _CohEst)
-        else:
-            test_methods = method
+            con = multivar_spectral_connectivity_epochs(
+                data, indices=([[0,2]], [[1,3]]), method=method, mode=mode, 
+                sfreq=self.sfreq, cwt_freqs=cwt_freqs, 
+                cwt_n_cycles=cwt_n_cycles, n_seed_components=None, 
+                n_target_components=None
+                )
+            assert np.all(con.get_data('raveled')[0, gidx[0]:gidx[1]] > upper_t), \
+                con.get_data()[0, gidx[0]:gidx[1]].min()
 
-        stc_data = _stc_gen(data, sfreq, tmin)
-        con2 = spectral_connectivity_epochs(
-            stc_data, method=test_methods, mode=mode, indices=indices,
-            sfreq=sfreq, mt_adaptive=adaptive, mt_low_bias=True,
-            mt_bandwidth=mt_bandwidth, tmin=tmin, tmax=tmax,
-            cwt_freqs=cwt_freqs, cwt_n_cycles=cwt_n_cycles)
 
-        assert isinstance(con2, list)
-        assert len(con2) == len(test_methods)
-        freqs2 = con2[0].attrs.get('freqs_used')
-        if 'times' in con2[0].dims:
-            times2 = con2[0].times
-        else:
-            times2 = con2[0].attrs.get('times_used')
-        n2 = con2[0].n_epochs_used
+    def test_parallel(self):
+        """Test parallel computation."""
+        n_jobs = 2
+        multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0]], [[1]]), sfreq=self.sfreq, 
+            n_jobs=n_jobs
+            )
 
-        if method == 'coh':
-            assert_array_almost_equal(con2[0].get_data(), con2[1].get_data())
+    def test_epochs_object(self):
+        info = mne.create_info(
+            ch_names=[f"ch_{n}" for n in range(self.n_signals)],
+            sfreq=self.sfreq
+            )
+        epochs = mne.EpochsArray(self.test_data, info)
+        
+        con_from_data = multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0]], [[1]]), sfreq=self.sfreq
+            )
 
-        if not isinstance(method, list):
-            con2 = con2[0]  # only keep the first method
+        con_from_epochs = multivar_spectral_connectivity_epochs(
+            epochs, indices=([[0]], [[1]])
+            )
 
-            # we get the same result for the probed connections
-            assert_array_almost_equal(freqs, freqs2)
+        assert_array_almost_equal(
+            con_from_epochs.get_data(), 
+            con_from_data.get_data()
+            )
 
-            # "con2" is a raveled array already, so
-            # simulate setting indices on the full output in "con"
-            assert_array_almost_equal(con.get_data(output='dense')[indices],
-                                      con2.get_data())
-            assert (n == n2)
-            assert_array_almost_equal(times_data, times2)
-        else:
-            # we get the same result for the probed connections
-            assert (len(con) == len(con2))
-            for c, c2 in zip(con, con2):
-                assert_array_almost_equal(freqs, freqs2)
-                assert_array_almost_equal(c.get_data(output='dense')[indices],
-                                          c2.get_data())
-                assert (n == n2)
-                assert_array_almost_equal(times_data, times2)
+        con_from_epochs = multivar_spectral_connectivity_epochs(
+            epochs, indices=([[0]], [[1]])
+            )
 
-        # Test with faverage
-        # compute same connections for two bands, fskip=1, and f. avg.
-        fmin = (5., 15.)
-        fmax = (15., 30.)
-        con3 = spectral_connectivity_epochs(
-            data, method=method, mode=mode, indices=indices,
-            sfreq=sfreq, fmin=fmin, fmax=fmax, fskip=1, faverage=True,
-            mt_adaptive=adaptive, mt_low_bias=True,
-            mt_bandwidth=mt_bandwidth, cwt_freqs=cwt_freqs,
-            cwt_n_cycles=cwt_n_cycles)
+        annotations = mne.Annotations(
+            onset=[0, 3], duration=[1, 0.25],
+            description=['Start', 'Noise'],
+        )
+        epochs.set_annotations((annotations))
+        con_with_annot = multivar_spectral_connectivity_epochs(
+            epochs, indices=([[0]], [[1]])
+            )
+        assert_array_almost_equal(
+            con_with_annot.get_data(), 
+            con_from_data.get_data()
+            )
 
-        if isinstance(method, list):
-            freqs3 = con3[0].attrs.get('freqs_used')
-        else:
-            freqs3 = con3.attrs.get('freqs_used')
+        epochs = mne.EpochsArray(self.test_data, info)
+        epochs.set_annotations((annotations))
+        epochs.add_annotations_to_metadata()
+        con_with_metadata = multivar_spectral_connectivity_epochs(
+            epochs, indices=([[0]], [[1]])
+            )
+        assert_array_almost_equal(
+            con_with_metadata.get_data(), 
+            con_from_data.get_data()
+            )
 
-        assert (isinstance(freqs3, list))
-        assert (len(freqs3) == len(fmin))
-        for i in range(len(freqs3)):
-            _fmin = max(fmin[i], min(cwt_freqs))
-            _fmax = min(fmax[i], max(cwt_freqs))
-            assert_allclose(freqs3[i][0], _fmin, atol=1)
-            assert_allclose(freqs3[i][1], _fmax, atol=1)
 
-        # average con2 "manually" and we get the same result
-        fskip = 1
-        if not isinstance(method, list):
-            for i in range(len(freqs3)):
-                # now we want to get the frequency indices
-                # create a frequency mask for all bands
-                n_times = len(con2.attrs.get('times_used'))
-
-                # compute frequencies to analyze based on number of samples,
-                # sampling rate, specified wavelet frequencies and mode
-                freqs = _compute_freqs(n_times, sfreq, cwt_freqs, mode)
-
-                # compute the mask based on specified min/max and decim factor
-                freq_mask = _compute_freq_mask(
-                    freqs, [fmin[i]], [fmax[i]], fskip)
-                freqs = freqs[freq_mask]
-                freqs_idx = np.searchsorted(freqs2, freqs)
-                con2_avg = np.mean(con2.get_data()[:, freqs_idx], axis=1)
-                assert_array_almost_equal(con2_avg, con3.get_data()[:, i])
-        else:
-            for j in range(len(con2)):
-                for i in range(len(freqs3)):
-                    # now we want to get the frequency indices
-                    # create a frequency mask for all bands
-                    n_times = len(con2[0].attrs.get('times_used'))
-
-                    # compute frequencies to analyze based on number of
-                    # samples, sampling rate, specified wavelet frequencies
-                    # and mode
-                    freqs = _compute_freqs(n_times, sfreq, cwt_freqs, mode)
-
-                    # compute the mask based on specified min/max and
-                    # decim factor
-                    freq_mask = _compute_freq_mask(
-                        freqs, [fmin[i]], [fmax[i]], fskip)
-                    freqs = freqs[freq_mask]
-                    freqs_idx = np.searchsorted(freqs2, freqs)
-
-                    con2_avg = np.mean(con2[j].get_data()[
-                                       :, freqs_idx], axis=1)
-                    assert_array_almost_equal(
-                        con2_avg, con3[j].get_data()[:, i])
-
-    # test _get_n_epochs
-    full_list = list(range(10))
-    out_lens = np.array([len(x) for x in _get_n_epochs(full_list, 4)])
-    assert ((out_lens == np.array([4, 4, 2])).all())
-    out_lens = np.array([len(x) for x in _get_n_epochs(full_list, 11)])
-    assert (len(out_lens) > 0)
-    assert (out_lens[0] == 10)
+    def test_faverage(self):
+        multivar_spectral_connectivity_epochs(
+            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+            fmin=(3, 8, 15), fmax=(7, 14, 20), faverage=True,
+            )

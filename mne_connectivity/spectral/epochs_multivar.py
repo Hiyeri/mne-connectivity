@@ -1,54 +1,33 @@
-# Authors: Thomas S. Binns <>
-#          Mariia Mikhailenko <>
+# Authors: Thomas S. Binns <thomas-samuel.binns@charite.de>
 #          Tien Dung Nguyen <>
+#          Richard M. Köhler <koehler.richard@charite.de>
 #          Veronika Shamova <>
+#          Mariia Mikhailenko <>
 #          Orestis Sylianou <>
 #          Jeroen Habets <>
-#          Richard M. Köhler <koehler.richard@charite.de>
 #
 # License: BSD (3-clause)
 
+import inspect
+from copy import deepcopy
 import numpy as np
 from mne import BaseEpochs
 from mne.parallel import parallel_func
 from mne.utils import logger
-from scipy import linalg as spla
 
 from ..base import SpectralConnectivity, SpectroTemporalConnectivity
-from ..utils import check_indices, fill_doc
 from .epochs import (_assemble_spectral_params, _check_estimators,
                      _epoch_spectral_connectivity, _get_and_verify_data_sizes,
                      _get_n_epochs, _prepare_connectivity)
 
 
-########################################################################
-# Various connectivity estimators
-
-
-@fill_doc
 def multivar_spectral_connectivity_epochs(
-    data,
-    indices,
-    names = None,
-    method = "mic",
-    sfreq = 2 * np.pi,
-    mode = "multitaper",
-    tmin = None,
-    tmax = None,
-    fmin = 0.0,
-    fmax = np.inf,
-    fskip = 0, 
-    faverage = False, 
-    cwt_freqs = None,
-    mt_bandwidth = None,
-    mt_adaptive = False,
-    mt_low_bias = True,
-    cwt_n_cycles = 7.0,
-    n_seed_components = None,
-    n_target_components = None,
-    block_size = 1000, 
-    n_jobs = 1,
-    verbose = None,
+    data, indices, names = None, method = "mic", sfreq = 2 * np.pi,
+    mode = "multitaper", tmin = None, tmax = None, fmin = None, fmax = np.inf,
+    fskip = 0, faverage = False, cwt_freqs = None, mt_bandwidth = None,
+    mt_adaptive = False, mt_low_bias = True, cwt_n_cycles = 7,
+    n_seed_components = None, n_target_components = None, gc_n_lags = 20,
+    block_size = 1000, n_jobs = 1, verbose = None,
 ):
     """Compute frequency-domain multivariate connectivity measures.
 
@@ -172,10 +151,134 @@ def multivar_spectral_connectivity_epochs(
         multiple methods are called, where each object is the results for the
         corresponding entry in "method").
     """
+    (
+        data, names, method, fmin, fmax, n_seed_components, n_target_components,
+        parallel, my_epoch_spectral_connectivity, n_bands, con_method_types,
+        events, event_id, times_in, metadata, sfreq, present_gc_methods,
+        perform_svd
+    ) = _sort_inputs(
+        data, indices, names, method, sfreq, mode, fmin, fmax,
+        n_seed_components, n_target_components, n_jobs, verbose
+    )
+
+    remaining_method_types = deepcopy(con_method_types)
+    if present_gc_methods and perform_svd:
+        # if singular value decomposition is being performed with Granger
+        # causality, this has to be performed on the timeseries data for each
+        # seed-target group separately.
+
+        # finds the GC methods to compute
+        use_method_types = [
+            mtype for mtype in con_method_types if mtype.name in
+            ["GC", "Net GC", "TRGC", "Net TRGC"]
+        ]
+
+        # creates an empty placeholder for non-GC connectivity results
+        if use_method_types == con_method_types:
+            con = []
+
+        # performs SVD on the timeseries data for each seed-target group
+        seed_target_data, n_seeds = _time_series_svd(
+            data, indices, n_seed_components, n_target_components
+        )
+
+        # computes GC for each seed-target group
+        n_gc_methods = len(present_gc_methods)
+        svd_gc_con = [[] for x in range(n_gc_methods)]
+        for gc_node_data, n_seed_comps in zip(seed_target_data, n_seeds):
+            new_indices = (
+                [np.arange(n_seed_comps).tolist()],
+                [np.arange(n_seed_comps, gc_node_data.shape[1]).tolist()]
+            )
+            (
+                con_methods, times, freqs_bands, freq_idx_bands, n_tapers,
+                n_epochs, n_cons, n_freqs, n_signals, freqs, _
+            ) = _compute_csd(
+                gc_node_data, new_indices, sfreq, mode, tmin, tmax, fmin, fmax,
+                fskip, faverage, cwt_freqs, mt_bandwidth, mt_adaptive,
+                mt_low_bias, cwt_n_cycles, block_size, n_jobs, n_bands,
+                use_method_types, parallel, my_epoch_spectral_connectivity,
+                times_in, gc_n_lags
+            )
+            group_con, freqs_used, n_nodes = _compute_connectivity(
+                con_methods, new_indices, n_seed_components,
+                n_target_components, n_epochs, n_cons, faverage, n_freqs,
+                n_bands, freq_idx_bands, freqs_bands, n_signals, freqs
+            )
+            [svd_gc_con[i].append(group_con[i]) for i in range(n_gc_methods)]
+        svd_gc_con = [np.squeeze(np.array(method_con), 1) for method_con in svd_gc_con]
+
+        # finds the methods still needing to be computed
+        remaining_method_types = [
+            mtype for mtype in con_method_types if mtype not in use_method_types
+        ]
+
+    if remaining_method_types:
+        # if no singular value decomposition is being performed or Granger
+        # causality is not being computed, the cross-spectral density can be
+        # computed as normal on all channels and used for the connectivity
+        # computations of each seed-target group.
+
+        # creates an empty placeholder for SVD GC connectivity results
+        if remaining_method_types == con_method_types:
+            svd_gc_con = []
+            use_method_types = []
+
+        # computes connectivity
+        (
+            con_methods, times, freqs_bands, freq_idx_bands, n_tapers,
+            n_epochs, n_cons, n_freqs, n_signals, freqs, remapped_indices
+        ) = _compute_csd(
+            data, indices, sfreq, mode, tmin, tmax, fmin, fmax, fskip, faverage,
+            cwt_freqs, mt_bandwidth, mt_adaptive, mt_low_bias, cwt_n_cycles,
+            block_size, n_jobs, n_bands, remaining_method_types, parallel,
+            my_epoch_spectral_connectivity, times_in, gc_n_lags
+        )
+        con, freqs_used, n_nodes = _compute_connectivity(
+            con_methods, remapped_indices, n_seed_components, n_target_components,
+            n_epochs, n_cons, faverage, n_freqs, n_bands, freq_idx_bands,
+            freqs_bands, n_signals, freqs
+        )
+
+    if svd_gc_con and con:
+        # combines SVD GC and non-SVD GC results
+        con.extend(svd_gc_con)
+        # orders the results according to the order they were called
+        methods_order = [
+            *[mtype.name for mtype in use_method_types],
+            *[mtype.name for mtype in remaining_method_types]
+        ]
+        con = [con[methods_order.index(mtype.name)] for mtype in con_method_types]
+    elif svd_gc_con and not con:
+        # stored SVD GC results
+        con = svd_gc_con
+        # finds the remapped indices of non-SVD data
+        unique_indices = np.unique(sum(sum(indices, []), []))
+        remapping = {ch_i: sig_i for sig_i, ch_i in enumerate(unique_indices)}
+        remapped_indices = [[[remapping[idx] for idx in idcs] for idcs in
+                             indices_group] for indices_group in indices]
+
+    return _store_connectivity(
+        con, method, names, freqs, n_nodes, mode, remapped_indices, n_epochs,
+        freqs_used, times, n_tapers, metadata, events, event_id
+    )
+
+
+def _sort_inputs(
+    data, indices, names, method, sfreq, mode, fmin, fmax, n_seed_components,
+    n_target_components, n_jobs, verbose
+):
+    """Checks the format of the input parameters to the
+    "multivar_spectral_connectivity_epochs" function and returns relevant
+    variables."""
+    # establishes parallelisation
     if n_jobs != 1:
         parallel, my_epoch_spectral_connectivity, _ = \
             parallel_func(_epoch_spectral_connectivity, n_jobs,
                           verbose=verbose)
+    else:
+        parallel = None
+        my_epoch_spectral_connectivity = None
 
     # format fmin and fmax and check inputs
     if fmin is None:
@@ -195,8 +298,7 @@ def multivar_spectral_connectivity_epochs(
         method = [method]  # make it a list so we can iterate over it
 
     # handle connectivity estimators
-    (con_method_types, n_methods, accumulate_psd,
-     _) = _check_estimators(method=method, mode=mode)
+    con_method_types, _, _, _ = _check_estimators(method, mode)
 
     events = None
     event_id = None
@@ -224,6 +326,121 @@ def multivar_spectral_connectivity_epochs(
         times_in = None
         metadata = None
 
+    # handle indices
+    if indices is None:
+        raise ValueError("indices must be specified, got `None`.")
+
+    n_seeds = len(indices[0])
+    n_targets = len(indices[1])
+    if n_seeds != n_targets:
+        raise ValueError(
+            f"The number of seeds ({n_seeds}) and targets ({n_targets}) must  "
+            "match."
+        )
+
+    for seeds, targets in zip(indices[0], indices[1]):
+        if set.intersection(set(seeds), set(targets)):
+            raise ValueError(
+                "There are common indices present in the seeds and targets for "
+                "a single connectivity index, however multivariate "
+                "connectivity between shared channels is not allowed."
+            )
+
+    perform_svd = False
+    if n_seed_components is None:
+        n_seed_components = tuple([None] * n_seeds)
+    else:
+        if n_seeds != len(n_seed_components):
+            raise ValueError(
+            "n_seed_components must have the same length as specified seeds."
+            f" Got: {len(n_seed_components)} seed components and {n_seeds}"
+            "seeds."
+            )
+        for n_comps, chs in zip(n_seed_components, indices[0]):
+            if n_comps:
+                if n_comps > len(chs) and n_comps <= 0:
+                    raise ValueError(
+                        f"The number of components to take ({n_comps}) cannot "
+                        "be greater than the number of channels in that seed "
+                        f"({len(chs)}) and must be greater than 0."
+                    )
+                perform_svd = True
+
+    if n_target_components is None:
+        n_target_components = tuple([None] * n_targets)
+    else:
+        if n_targets != len(n_target_components):
+            raise ValueError(
+            "n_target_components must have the same length as specified"
+            f" targets. Got: {len(n_target_components)} target components and"
+            f" {n_targets} targets."
+            )
+        for n_comps, chs in zip(n_target_components, indices[1]):
+            if n_comps:
+                if n_comps is not None and n_comps > len(chs) and n_comps <= 0:
+                    raise ValueError(
+                        f"The number of components to take ({n_comps}) cannot "
+                        "be greater than the number of channels in that target "
+                        f"({len(chs)}) and must be greater than 0."
+                    )
+                perform_svd = True
+
+    # handle Granger causality methods
+    present_gc_methods = [
+        con_method for con_method in method
+        if con_method in ["gc", "net_gc", "trgc", "net_trgc"]
+    ]
+
+    return (
+        data, names, method, fmin, fmax, n_seed_components, n_target_components,
+        parallel, my_epoch_spectral_connectivity, n_bands, con_method_types,
+        events, event_id, times_in, metadata, sfreq, present_gc_methods,
+        perform_svd
+    )
+
+def _time_series_svd(data, indices, n_seed_components, n_target_components):
+    """Performs a single value decomposition on the timeseries data for each set
+    of seed-target pairs."""
+    if isinstance(data, BaseEpochs):
+        epochs = data.get_data(picks=data.ch_names)
+    else:
+        epochs = data
+
+    seed_target_data = []
+    n_seeds = []
+    for seeds, targets, n_seed_comps, n_target_comps in \
+        zip(indices[0], indices[1], n_seed_components, n_target_components):
+
+        if n_seed_comps: # SVD seed data
+            v_seeds = (
+                np.linalg.svd(epochs[:, seeds, :], full_matrices=False)[2]
+                [:, :n_seed_comps, :]
+            )
+        else: # use unaltered seed data
+            v_seeds = epochs[:, seeds, :]
+        n_seeds.append(v_seeds.shape[1])
+
+        if n_target_comps: # SVD target data
+            v_targets = (
+                np.linalg.svd(epochs[:, targets, :], full_matrices=False)[2]
+                [:, :n_target_comps, :]
+            )
+        else: # use unaltered target data
+            v_targets = epochs[:, targets, :]
+
+        seed_target_data.append(np.append(v_seeds, v_targets, axis=1))
+
+    return seed_target_data, n_seeds
+
+
+def _compute_csd(
+    data, indices, sfreq, mode, tmin, tmax, fmin, fmax, fskip, faverage,
+    cwt_freqs, mt_bandwidth, mt_adaptive, mt_low_bias, cwt_n_cycles, block_size,
+    n_jobs, n_bands, con_method_types, parallel, my_epoch_spectral_connectivity,
+    times_in, gc_n_lags
+):
+    """Computes the cross-spectral density of the data in preparation for the
+    multivariate connectivity computations."""
     # loop over data; it could be a generator that returns
     # (n_signals x n_times) arrays or SourceEstimates
     epoch_idx = 0
@@ -234,7 +451,7 @@ def multivar_spectral_connectivity_epochs(
             # initialize everything times and frequencies
             (n_cons, times, n_times, times_in, n_times_in, tmin_idx,
              tmax_idx, n_freqs, freq_mask, freqs, freqs_bands, freq_idx_bands,
-             n_signals, indices_use, warn_times) = _prepare_connectivity(
+             n_signals, _, warn_times) = _prepare_connectivity(
                 epoch_block=epoch_block, times_in=times_in,
                 tmin=tmin, tmax=tmax, fmin=fmin, fmax=fmax, sfreq=sfreq,
                 indices=indices, mode=mode, fskip=fskip, n_bands=n_bands,
@@ -248,22 +465,35 @@ def multivar_spectral_connectivity_epochs(
                 mt_low_bias=mt_low_bias, cwt_n_cycles=cwt_n_cycles,
                 cwt_freqs=cwt_freqs, freqs=freqs, freq_mask=freq_mask)
 
-            # unique signals for which we actually need to compute CSD etc.
-            sig_idx = np.unique([idx for indices_group in indices for idcs in
-                indices_group for idx in idcs])
-
             # map indices to unique indices
-            idx_map = [np.searchsorted(sig_idx, idx) for idcs in indices_use for idx in idcs]
+            unique_indices = np.unique(sum(sum(indices, []), []))
+            remapping = {ch_i: sig_i for sig_i, ch_i in
+                         enumerate(unique_indices)}
+            remapped_indices = [[[remapping[idx] for idx in idcs] for idcs in
+                                indices_group] for indices_group in indices]
 
-            # None of the implemented multivariate methods need PSD
-            psd = None
+            # unique signals for which we actually need to compute CSD etc.
+            sig_idx = np.unique(sum(sum(remapped_indices, []), []))
+            n_signals = len(sig_idx)
+
+            # gets seed-target indices for CSD
+            idx_map = [np.repeat(sig_idx, len(sig_idx)),
+                       np.tile(sig_idx, len(sig_idx))]
 
             # create instances of the connectivity estimators
-            con_methods = [mtype(n_cons, n_freqs, n_times_spectrum)
-                           for mtype in con_method_types]
+            con_methods = []
+            for mtype in con_method_types:
+                if "n_lags" in list(inspect.signature(mtype).parameters):
+                    con_methods.append(
+                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum,
+                              gc_n_lags)
+                    )
+                else:
+                    con_methods.append(
+                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum)
+                    )
 
-            sep = ', '
-            metrics_str = sep.join([meth.name for meth in con_methods])
+            metrics_str = ', '.join([meth.name for meth in con_methods])
             logger.info('    the following metrics will be computed: %s'
                         % metrics_str)
 
@@ -274,15 +504,14 @@ def multivar_spectral_connectivity_epochs(
                 warn_times=warn_times)
 
         call_params = dict(
-            sig_idx=sig_idx, tmin_idx=tmin_idx,
-            tmax_idx=tmax_idx, sfreq=sfreq, mode=mode,
-            freq_mask=freq_mask, idx_map=idx_map, block_size=block_size,
-            psd=psd, accumulate_psd=accumulate_psd,
-            mt_adaptive=mt_adaptive,
-            con_method_types=con_method_types,
+            sig_idx=sig_idx, tmin_idx=tmin_idx, tmax_idx=tmax_idx, sfreq=sfreq,
+            mode=mode, freq_mask=freq_mask, idx_map=idx_map,
+            block_size=block_size, psd=None, accumulate_psd=False,
+            mt_adaptive=mt_adaptive, con_method_types=con_method_types,
             con_methods=con_methods if n_jobs == 1 else None,
-            n_signals=n_signals, n_times=n_times,
-            accumulate_inplace=True if n_jobs == 1 else False)
+            n_signals=n_signals, n_times=n_times, gc_n_lags=gc_n_lags,
+            accumulate_inplace=True if n_jobs == 1 else False
+        )
         call_params.update(**spectral_params)
 
         if n_jobs == 1:
@@ -305,30 +534,46 @@ def multivar_spectral_connectivity_epochs(
             for this_out in out:
                 for _method, parallel_method in zip(con_methods, this_out[0]):
                     _method.combine(parallel_method)
-                if accumulate_psd:
-                    psd += this_out[1]
 
             epoch_idx += len(epoch_block)
 
     n_epochs = epoch_idx
 
+    return (
+        con_methods, times, freqs_bands, freq_idx_bands, n_tapers, n_epochs,
+        n_cons, n_freqs, n_signals, freqs, remapped_indices
+    )
+
+def _compute_connectivity(
+    con_methods, indices, n_seed_components, n_target_components, n_epochs,
+    n_cons, faverage, n_freqs, n_bands, freq_idx_bands, freqs_bands, n_signals,
+    freqs
+):
+    """Computes the multivariate connectivity results."""
     # compute final connectivity scores
     con = list()
     for conn_method in con_methods:
-        conn_method.compute_con(
-            seeds, targets, n_seed_components, n_target_components, n_epochs
-        )
+        if conn_method.name in ["GC", "Net GC", "TRGC", "Net TRGC"]:
+            conn_method.compute_con(indices[0], indices[1], n_epochs)
+        else:
+            conn_method.compute_con(
+                indices[0], indices[1], n_seed_components, n_target_components,
+                n_epochs
+            )
 
         # get the connectivity scores
         this_con = conn_method.con_scores
 
-        if this_con.shape[0] != n_cons:
-            raise ValueError('First dimension of connectivity scores must be '
-                             'the same as the number of connections')
+        assert (this_con.shape[0] == n_cons), \
+            ('The first dimension of connectivity scores does not match the '
+            'number of connections. Please contact the mne-connectivity ' 
+            'developers.')
+
         if faverage:
-            if this_con.shape[1] != n_freqs:
-                raise ValueError('2nd dimension of connectivity scores must '
-                                 'be the same as the number of frequencies')
+            assert (this_con.shape[1] == n_freqs), \
+            ('The second dimension of connectivity scores does not match the '
+            'number of frequencies. Please contact the mne-connectivity ' 
+            'developers.')
             con_shape = (n_cons, n_bands) + this_con.shape[2:]
             this_con_bands = np.empty(con_shape, dtype=this_con.dtype)
             for band_idx in range(n_bands):
@@ -353,13 +598,21 @@ def multivar_spectral_connectivity_epochs(
     # number of nodes in the original data,
     n_nodes = n_signals
 
+    return con, freqs_used, n_nodes
+
+def _store_connectivity(
+    con, method, names, freqs, n_nodes, mode, indices, n_epochs, freqs_used,
+    times, n_tapers, metadata, events, event_id
+):
+    """Stores multivariate connectivity results in an mne-connectivity
+    object."""
     # create a list of connectivity containers
     conn_list = []
-    for _con in con:
+    for _con, _method in zip(con, method):
         kwargs = dict(data=_con,
                       names=names,
                       freqs=freqs,
-                      method=method,
+                      method=_method,
                       n_nodes=n_nodes,
                       spec_method=mode,
                       indices=indices,
@@ -382,7 +635,7 @@ def multivar_spectral_connectivity_epochs(
 
     logger.info('[Connectivity computation done]')
 
-    if n_methods == 1:
+    if len(method) == 1:
         # for a single method return connectivity directly
         conn_list = conn_list[0]
 

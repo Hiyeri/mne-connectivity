@@ -18,6 +18,11 @@ from mne.time_frequency.tfr import cwt, morlet
 from mne.time_frequency.multitaper import _compute_mt_params
 from mne.utils import (_arange_div, _check_option, logger, warn, _time_mask)
 
+from .epochs_classes import (_AbstractConEstBase, _CohEst, _CohyEst, _ImCohEst,
+                            _PLVEst, _ciPLVEst, _PPCEst, _PLIEst,
+                            _PLIUnbiasedEst, _DPLIEst, _WPLIEst,
+                            _WPLIDebiasedEst, _MICEst, _MIMEst, _GCEst,
+                            _NetGCEst, _TRGCEst, _NetTRGCEst)
 from ..base import (SpectralConnectivity, SpectroTemporalConnectivity)
 from ..utils import fill_doc, check_indices
 
@@ -198,505 +203,13 @@ def _assemble_spectral_params(mode, n_times, mt_adaptive, mt_bandwidth, sfreq,
     return spectral_params, mt_adaptive, n_times_spectrum, n_tapers
 
 
-########################################################################
-# Various connectivity estimators
-
-
-class _AbstractConEstBase(object):
-    """ABC for connectivity estimators."""
-
-    def start_epoch(self):
-        raise NotImplementedError('start_epoch method not implemented')
-
-    def accumulate(self, con_idx, csd_xy):
-        raise NotImplementedError('accumulate method not implemented')
-
-    def combine(self, other):
-        raise NotImplementedError('combine method not implemented')
-
-    def compute_con(self, con_idx, n_epochs):
-        raise NotImplementedError('compute_con method not implemented')
-
-
-class _EpochMeanConEstBase(_AbstractConEstBase):
-    """Base class for methods that estimate connectivity as mean epoch-wise."""
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        self.n_cons = n_cons
-        self.n_freqs = n_freqs
-        self.n_times = n_times
-
-        if n_times == 0:
-            self.csd_shape = (n_cons, n_freqs)
-        else:
-            self.csd_shape = (n_cons, n_freqs, n_times)
-
-        self.con_scores = None
-
-    def start_epoch(self):  # noqa: D401
-        """Called at the start of each epoch."""
-        pass  # for this type of con. method we don't do anything
-
-    def combine(self, other):
-        """Include con. accumated for some epochs in this estimate."""
-        self._acc += other._acc
-
-
-class _CohEstBase(_EpochMeanConEstBase):
-    """Base Estimator for Coherence, Coherency, Imag. Coherence."""
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_CohEstBase, self).__init__(n_cons, n_freqs, n_times)
-
-        # allocate space for accumulation of CSD
-        self._acc = np.zeros(self.csd_shape, dtype=np.complex128)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate CSD for some connections."""
-        self._acc[con_idx] += csd_xy
-
-
-class _CohEst(_CohEstBase):
-    """Coherence Estimator."""
-
-    name = 'Coherence'
-
-    def compute_con(self, con_idx, n_epochs, psd_xx, psd_yy):  # lgtm
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        csd_mean = self._acc[con_idx] / n_epochs
-        self.con_scores[con_idx] = np.abs(csd_mean) / np.sqrt(psd_xx * psd_yy)
-
-
-class _CohyEst(_CohEstBase):
-    """Coherency Estimator."""
-
-    name = 'Coherency'
-
-    def compute_con(self, con_idx, n_epochs, psd_xx, psd_yy):  # lgtm
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape,
-                                       dtype=np.complex128)
-        csd_mean = self._acc[con_idx] / n_epochs
-        self.con_scores[con_idx] = csd_mean / np.sqrt(psd_xx * psd_yy)
-
-
-class _ImCohEst(_CohEstBase):
-    """Imaginary Coherence Estimator."""
-
-    name = 'Imaginary Coherence'
-
-    def compute_con(self, con_idx, n_epochs, psd_xx, psd_yy):  # lgtm
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        csd_mean = self._acc[con_idx] / n_epochs
-        self.con_scores[con_idx] = np.imag(csd_mean) / np.sqrt(psd_xx * psd_yy)
-
-
-class _PLVEst(_EpochMeanConEstBase):
-    """PLV Estimator."""
-
-    name = 'PLV'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_PLVEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # allocate accumulator
-        self._acc = np.zeros(self.csd_shape, dtype=np.complex128)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        self._acc[con_idx] += csd_xy / np.abs(csd_xy)
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        plv = np.abs(self._acc / n_epochs)
-        self.con_scores[con_idx] = plv
-
-
-class _ciPLVEst(_EpochMeanConEstBase):
-    """corrected imaginary PLV Estimator."""
-
-    name = 'ciPLV'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_ciPLVEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # allocate accumulator
-        self._acc = np.zeros(self.csd_shape, dtype=np.complex128)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        self._acc[con_idx] += csd_xy / np.abs(csd_xy)
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        imag_plv = np.abs(np.imag(self._acc)) / n_epochs
-        real_plv = np.real(self._acc) / n_epochs
-        real_plv = np.clip(real_plv, -1, 1)  # bounded from -1 to 1
-        mask = (np.abs(real_plv) == 1)  # avoid division by 0
-        real_plv[mask] = 0
-        corrected_imag_plv = imag_plv / np.sqrt(1 - real_plv ** 2)
-        self.con_scores[con_idx] = corrected_imag_plv
-
-
-class _PLIEst(_EpochMeanConEstBase):
-    """PLI Estimator."""
-
-    name = 'PLI'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_PLIEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # allocate accumulator
-        self._acc = np.zeros(self.csd_shape)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        self._acc[con_idx] += np.sign(np.imag(csd_xy))
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        pli_mean = self._acc[con_idx] / n_epochs
-        self.con_scores[con_idx] = np.abs(pli_mean)
-
-
-class _PLIUnbiasedEst(_PLIEst):
-    """Unbiased PLI Square Estimator."""
-
-    name = 'Unbiased PLI Square'
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-        pli_mean = self._acc[con_idx] / n_epochs
-
-        # See Vinck paper Eq. (30)
-        con = (n_epochs * pli_mean ** 2 - 1) / (n_epochs - 1)
-
-        self.con_scores[con_idx] = con
-
-
-class _DPLIEst(_EpochMeanConEstBase):
-    """DPLI Estimator."""
-
-    name = 'DPLI'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_DPLIEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # allocate accumulator
-        self._acc = np.zeros(self.csd_shape)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        self._acc[con_idx] += np.heaviside(np.imag(csd_xy), 0.5)
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-
-        con = self._acc[con_idx] / n_epochs
-
-        self.con_scores[con_idx] = con
-
-
-class _WPLIEst(_EpochMeanConEstBase):
-    """WPLI Estimator."""
-
-    name = 'WPLI'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_WPLIEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # store  both imag(csd) and abs(imag(csd))
-        acc_shape = (2,) + self.csd_shape
-        self._acc = np.zeros(acc_shape)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        im_csd = np.imag(csd_xy)
-        self._acc[0, con_idx] += im_csd
-        self._acc[1, con_idx] += np.abs(im_csd)
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-
-        num = np.abs(self._acc[0, con_idx])
-        denom = self._acc[1, con_idx]
-
-        # handle zeros in denominator
-        z_denom = np.where(denom == 0.)
-        denom[z_denom] = 1.
-
-        con = num / denom
-
-        # where we had zeros in denominator, we set con to zero
-        con[z_denom] = 0.
-
-        self.con_scores[con_idx] = con
-
-
-class _WPLIDebiasedEst(_EpochMeanConEstBase):
-    """Debiased WPLI Square Estimator."""
-
-    name = 'Debiased WPLI Square'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_WPLIDebiasedEst, self).__init__(n_cons, n_freqs, n_times)
-        # store imag(csd), abs(imag(csd)), imag(csd)^2
-        acc_shape = (3,) + self.csd_shape
-        self._acc = np.zeros(acc_shape)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        im_csd = np.imag(csd_xy)
-        self._acc[0, con_idx] += im_csd
-        self._acc[1, con_idx] += np.abs(im_csd)
-        self._acc[2, con_idx] += im_csd ** 2
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-
-        # note: we use the trick from fieldtrip to compute the
-        # the estimate over all pairwise epoch combinations
-        sum_im_csd = self._acc[0, con_idx]
-        sum_abs_im_csd = self._acc[1, con_idx]
-        sum_sq_im_csd = self._acc[2, con_idx]
-
-        denom = sum_abs_im_csd ** 2 - sum_sq_im_csd
-
-        # handle zeros in denominator
-        z_denom = np.where(denom == 0.)
-        denom[z_denom] = 1.
-
-        con = (sum_im_csd ** 2 - sum_sq_im_csd) / denom
-
-        # where we had zeros in denominator, we set con to zero
-        con[z_denom] = 0.
-
-        self.con_scores[con_idx] = con
-
-
-class _PPCEst(_EpochMeanConEstBase):
-    """Pairwise Phase Consistency (PPC) Estimator."""
-
-    name = 'PPC'
-
-    def __init__(self, n_cons, n_freqs, n_times):
-        super(_PPCEst, self).__init__(n_cons, n_freqs, n_times)
-
-        # store csd / abs(csd)
-        self._acc = np.zeros(self.csd_shape, dtype=np.complex128)
-
-    def accumulate(self, con_idx, csd_xy):
-        """Accumulate some connections."""
-        denom = np.abs(csd_xy)
-        z_denom = np.where(denom == 0.)
-        denom[z_denom] = 1.
-        this_acc = csd_xy / denom
-        this_acc[z_denom] = 0.  # handle division by zero
-
-        self._acc[con_idx] += this_acc
-
-    def compute_con(self, con_idx, n_epochs):
-        """Compute final con. score for some connections."""
-        if self.con_scores is None:
-            self.con_scores = np.zeros(self.csd_shape)
-
-        # note: we use the trick from fieldtrip to compute the
-        # the estimate over all pairwise epoch combinations
-        con = ((self._acc[con_idx] * np.conj(self._acc[con_idx]) - n_epochs) /
-               (n_epochs * (n_epochs - 1.)))
-
-        self.con_scores[con_idx] = np.real(con)
-
-class _MICMIMEstBase(_CohEstBase):
-    """Base Estimator for MIC and MIM."""
-
-    def cross_spectra_svd(
-        self, csd, n_seeds, n_seed_components, n_target_components
-    ):
-        """Performs dimensionality reduction on a cross-spectral density using
-        singular value decomposition (SVD)."""
-        C_aa = csd[:n_seeds, :n_seeds]
-        C_ab = csd[:n_seeds, n_seeds:]
-        C_bb = csd[n_seeds:, n_seeds:]
-        C_ba = csd[n_seeds:, :n_seeds]
-
-        # Eq. 32
-        if n_seed_components is not None:
-            self.check_svd_params(n_seeds, n_seed_components)
-            U_aa, _, _ = np.linalg.svd(np.real(C_aa), full_matrices=False)
-            U_bar_aa = U_aa[:, :n_seed_components]
-        else:
-            U_bar_aa = np.identity(C_aa.shape[0])
-        if n_target_components is not None:
-            self.check_svd_params(csd.shape[0] - n_seeds, n_target_components)
-            U_bb, _, _ = np.linalg.svd(np.real(C_bb), full_matrices=False)
-            U_bar_bb = U_bb[:, :n_target_components]
-        else:
-            U_bar_bb = np.identity(C_bb.shape[0])
-
-        # Eq. 33
-        C_bar_aa = np.matmul(U_bar_aa.T, np.matmul(C_aa, U_bar_aa))
-        C_bar_ab = np.matmul(U_bar_aa.T, np.matmul(C_ab, U_bar_bb))
-        C_bar_bb = np.matmul(U_bar_bb.T, np.matmul(C_bb, U_bar_bb))
-        C_bar_ba = np.matmul(U_bar_bb.T, np.matmul(C_ba, U_bar_aa))
-        C_bar = np.vstack(
-            (np.hstack((C_bar_aa, C_bar_ab)), np.hstack((C_bar_ba, C_bar_bb)))
-        )
-
-        return C_bar, U_bar_aa, U_bar_bb
-
-    def check_svd_params(self, n_signals, take_n_components):
-        """Checks that the parameters used for a singular value decomposition"
-        are compatible with the data being used."""
-        if take_n_components == 0:
-            raise ValueError(
-                "0 components are being taken from the singular value "
-                "decomposition, but this must be at least 1."
-            )
-        if take_n_components > n_signals:
-            raise ValueError(
-                f"At most {n_signals} components can be taken from the "
-                f"singular value decomposition, but {take_n_components} are "
-                "being taken."
-            )
-
-    def mim_mic_compute_e(self, csd, n_seeds):
-        """Computes E as the imaginary part of the transformed cross-spectra D
-        derived from the original cross-spectra "csd" between the seed and target
-        signals."""
-        # Equation 3
-        T = np.zeros(csd.shape)
-        T[:n_seeds, :n_seeds] = spla.fractional_matrix_power(
-            np.real(csd[:n_seeds, :n_seeds]), -0.5
-        )  # real(C_aa)^-1/2
-        T[n_seeds:, n_seeds:] = spla.fractional_matrix_power(
-            np.real(csd[n_seeds:, n_seeds:]), -0.5
-        )  # real(C_bb)^-1/2
-
-        # Equation 4
-        D = np.matmul(T, np.matmul(csd, T))
-
-        # E as the imaginary part of D between seeds and targets
-        E = np.imag(D[:n_seeds, n_seeds:])
-
-        return E
-
-
-class _MIMEst(_MICMIMEstBase):
-    """Estimator for MIM (multivariate interaction measure)"""
-
-    name = "MIM"
-
-    def compute_con(
-        self, seeds, targets, n_seed_components, n_target_components, n_epochs
-    ):
-        """Computes the multivariate interaction measure between two sets of
-        signals"""
-        self.con_scores = np.zeros(self.csd_shape)
-
-        csd = self._acc / n_epochs
-
-        n_nodes = len(seeds)
-        n_freqs = csd.shape[2]
-
-        mim = np.zeros((n_nodes, n_freqs))
-        node_i = 0
-        for seed_idcs, target_idcs in zip(seeds, targets):
-            node_idcs = [*seed_idcs, *target_idcs]
-            node_csd = csd[np.ix_(node_idcs, node_idcs, np.arange(n_freqs))]
-            for freq_i in range(n_freqs):
-                # Eqs. 32 & 33
-                C_bar, U_bar_aa, _ = self.cross_spectra_svd(
-                    csd=node_csd[:, :, freq_i],
-                    n_seeds=len(seed_idcs),
-                    n_seed_components=n_seed_components[node_i],
-                    n_target_components=n_target_components[node_i],
-                )
-
-                # Eqs. 3 & 4
-                E = self.mim_mic_compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[1])
-
-                # Equation 14
-                mim[node_i, freq_i] = np.trace(np.matmul(E, np.conj(E).T))
-            node_i += 1
-
-        self.con_scores = mim
-
-
-class _MICEst(_MICMIMEstBase):
-    """Estimator for MIC (maximized imaginary coherence)"""
-
-    name = "MIC"
-
-    def compute_con(
-        self, seeds, targets, n_seed_components, n_target_components, n_epochs
-    ):
-        """Computes the maximized imaginary coherence between two sets of
-        signals"""
-        csd = self._acc / n_epochs
-
-        n_nodes = len(seeds)
-        n_freqs = csd.shape[2]
-
-        mic = np.zeros((n_nodes, n_freqs))
-        node_i = 0
-        for seed_idcs, target_idcs in zip(seeds, targets):
-            n_seeds = len(seed_idcs)
-            node_idcs = [*seed_idcs, *target_idcs]
-            node_csd = csd[np.ix_(node_idcs, node_idcs, np.arange(n_freqs))]
-            for freq_i in range(n_freqs):
-                # Eqs. 32 & 33
-                C_bar, U_bar_aa, _ = self.cross_spectra_svd(
-                    csd=node_csd[:, :, freq_i],
-                    n_seeds=n_seeds,
-                    n_seed_components=n_seed_components[node_i],
-                    n_target_components=n_target_components[node_i],
-                )
-
-                # Eqs. 3 & 4
-                E = self.mim_mic_compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[1])
-
-                # Weights for signals in the groups
-                w_a, V_a = np.linalg.eigh(np.matmul(E, np.conj(E).T))
-                w_b, V_b = np.linalg.eigh(np.matmul(np.conj(E).T, E))
-                alpha = V_a[:, w_a.argmax()]
-                beta = V_b[:, w_b.argmax()]
-
-                # Eq. 7
-                mic[node_i, freq_i] = (
-                    np.matmul(np.conj(alpha).T, np.matmul(E, beta))
-                    / np.linalg.norm(alpha)
-                    * np.linalg.norm(beta)
-                )
-            node_i += 1
-        self.con_scores = mic
-
 
 ###############################################################################
 def _epoch_spectral_connectivity(data, sig_idx, tmin_idx, tmax_idx, sfreq,
                                  mode, window_fun, eigvals, wavelets,
                                  freq_mask, mt_adaptive, idx_map, block_size,
                                  psd, accumulate_psd, con_method_types,
-                                 con_methods, n_signals, n_times,
+                                 con_methods, n_signals, n_times, gc_n_lags,
                                  accumulate_inplace=True):
     """Estimate connectivity for one epoch (see spectral_connectivity)."""
     n_cons = len(idx_map[0])
@@ -708,10 +221,25 @@ def _epoch_spectral_connectivity(data, sig_idx, tmin_idx, tmax_idx, sfreq,
         n_times_spectrum = 0
         n_freqs = np.sum(freq_mask)
 
+    n_signals = len(np.unique(idx_map[0]))
+
     if not accumulate_inplace:
         # instantiate methods only for this epoch (used in parallel mode)
-        con_methods = [mtype(n_cons, n_freqs, n_times_spectrum)
-                       for mtype in con_method_types]
+        con_methods = []
+        for mtype in con_method_types:
+            method_params = list(inspect.signature(mtype).parameters)
+            if "n_signals" in method_params:
+                if "n_lags" in method_params:
+                    con_methods.append(
+                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum,
+                              gc_n_lags)
+                    )
+                else:
+                    con_methods.append(
+                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum)
+                    )
+            else:
+                con_methods.append(mtype(n_cons, n_freqs, n_times_spectrum))
 
     _check_option('mode', mode, ('cwt_morlet', 'multitaper', 'fourier'))
     if len(sig_idx) == n_signals:
@@ -891,7 +419,8 @@ _CON_METHOD_MAP = {'coh': _CohEst, 'cohy': _CohyEst, 'imcoh': _ImCohEst,
                    'pli': _PLIEst, 'pli2_unbiased': _PLIUnbiasedEst,
                    'dpli': _DPLIEst, 'wpli': _WPLIEst,
                    'wpli2_debiased': _WPLIDebiasedEst, 'mic': _MICEst,
-                   'mim': _MIMEst}
+                   'mim': _MIMEst, 'gc': _GCEst, 'net_gc': _NetGCEst,
+                   'trgc': _TRGCEst, 'net_trgc': _NetTRGCEst}
 
 
 def _check_estimators(method, mode):
@@ -916,12 +445,9 @@ def _check_estimators(method, mode):
     n_comp_args = [len(inspect.signature(mtype.compute_con).parameters)
                    for mtype in con_method_types]
 
-    # we currently only support 3 arguments
-    if any(n not in (3, 5, 6) for n in n_comp_args):
-        raise ValueError('The .compute_con method needs to have either '
-                         '3, 5 or 6 arguments')
     # if none of the comp_con functions needs the PSD, we don't estimate it
-    accumulate_psd = any(n == 5 for n in n_comp_args)
+    accumulate_psd = any([mtype.accumulate_psd for mtype in con_method_types])
+    
     return con_method_types, n_methods, accumulate_psd, n_comp_args
 
 
@@ -1347,11 +873,11 @@ def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
 
     # create a list of connectivity containers
     conn_list = []
-    for _con in con:
+    for _con, _method in zip(con, method):
         kwargs = dict(data=_con,
                       names=names,
                       freqs=freqs,
-                      method=method,
+                      method=_method,
                       n_nodes=n_nodes,
                       spec_method=mode,
                       indices=indices,
