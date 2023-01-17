@@ -1,16 +1,15 @@
 # Authors: Martin Luessi <mluessi@nmr.mgh.harvard.edu>
 #          Denis A. Engemann <denis.engemann@gmail.com>
 #          Adam Li <adam2392@gmail.com>
-#          Thomas Samuel Binns <thomas-samuel.binns@charite.de>
+#          Thomas Samuel Binns <t.s.binns@outlook.com>
 #
 # License: BSD (3-clause)
 
+import copy
 import numpy as np
 from scipy import linalg as spla
-
-
-########################################################################
-# Various connectivity estimators
+from mne.parallel import parallel_func
+from mne.utils import logger, ProgressBar
 
 
 class _AbstractConEstBase(object):
@@ -56,11 +55,16 @@ class _EpochMeanConEstBase(_AbstractConEstBase):
 class _EpochMeanMultivarConEstBase(_AbstractConEstBase):
     """Base class for methods that estimate connectivity as mean epoch-wise."""
 
-    def __init__(self, n_signals, n_cons, n_freqs, n_times):
+    name = None
+    accumulate_psd = False
+    n_steps = None
+
+    def __init__(self, n_signals, n_cons, n_freqs, n_times, n_jobs=1):
         self.n_signals = n_signals
         self.n_cons = n_cons
         self.n_freqs = n_freqs
         self.n_times = n_times
+        self.n_jobs = n_jobs
 
         if n_times == 0:
             self.csd_shape = (n_signals**2, n_freqs)
@@ -71,6 +75,10 @@ class _EpochMeanMultivarConEstBase(_AbstractConEstBase):
         
         # allocate space for accumulation of CSD
         self._acc = np.zeros(self.csd_shape, dtype=np.complex128)
+
+        self.topographies = None
+
+        self._compute_n_progress_bar_steps()
 
     def start_epoch(self):  # noqa: D401
         """Called at the start of each epoch."""
@@ -84,6 +92,23 @@ class _EpochMeanMultivarConEstBase(_AbstractConEstBase):
         """Accumulate CSD for some connections."""
         self._acc[con_idx] += csd_xy
 
+    def _compute_n_progress_bar_steps(self):
+        """Calculates the number of steps to include in the progress bar."""
+        self.n_steps = int(np.ceil(self.n_freqs / self.n_jobs))  
+
+    def _log_connection_number(self, con_i, con_name):
+        """Logs the number of the connection being computed."""
+        logger.info(
+            f'Computing {con_name} for connection {con_i+1} of {self.n_cons}'
+        )
+    
+    def _get_block_indices(self, block_i, limit):
+        """Gets indices for a given computation block, excluding those values >=
+        a specified limit."""
+        indices = np.arange(block_i * self.n_jobs, (block_i+1) * self.n_jobs)
+
+        return indices[np.nonzero(indices < limit)]
+
     def reshape_csd(self):
         """Reshapes CSD into a matrix of times x freqs x signals x signals."""
         if self.n_times == 0:
@@ -95,11 +120,6 @@ class _EpochMeanMultivarConEstBase(_AbstractConEstBase):
             np.reshape(self._acc, (self.n_signals, self.n_signals, self.n_freqs,
             self.n_times)).transpose(3, 2, 0, 1)
         )
-
-    def reshape_con_scores(self):
-        """Removes the time dimension from con. scores, if necessary."""
-        if self.n_times == 0:
-            self.con_scores = self.con_scores[:,:,0]
 
 
 class _CohEstBase(_EpochMeanConEstBase):
@@ -114,408 +134,6 @@ class _CohEstBase(_EpochMeanConEstBase):
     def accumulate(self, con_idx, csd_xy):
         """Accumulate CSD for some connections."""
         self._acc[con_idx] += csd_xy
-
-class _MultivarCohEstBase(_EpochMeanMultivarConEstBase):
-    """Base Estimator for coherence-based multivariate methods."""
-
-    def cross_spectra_svd(
-        self, csd, n_seeds, n_seed_components, n_target_components
-    ):
-        """Performs dimensionality reduction on a cross-spectral density using
-        singular value decomposition (SVD)."""
-        n_times = csd.shape[0]
-        n_targets = csd.shape[2]-n_seeds
-        C_aa = csd[:, :, :n_seeds, :n_seeds]
-        C_ab = csd[:, :, :n_seeds, n_seeds:]
-        C_bb = csd[:, :, n_seeds:, n_seeds:]
-        C_ba = csd[:, :, n_seeds:, :n_seeds]
-
-        # Eq. 32
-        if n_seed_components is not None:
-            U_aa = np.linalg.svd(np.real(C_aa), full_matrices=False)[0]
-            U_bar_aa = U_aa[:, :, :, :n_seed_components]
-        else:
-            U_bar_aa = np.broadcast_to(np.identity(n_seeds), (n_times, self.n_freqs)+(n_seeds, n_seeds))
-        if n_target_components is not None:
-            U_bb = np.linalg.svd(np.real(C_bb), full_matrices=False)[0]
-            U_bar_bb = U_bb[:, :, :, :n_target_components]
-        else:
-            U_bar_bb = np.broadcast_to(np.identity(n_targets), (n_times, self.n_freqs)+(n_targets, n_targets))
-
-        # Eq. 33
-        C_bar_aa = np.matmul(U_bar_aa.transpose(0, 1, 3, 2), np.matmul(C_aa, U_bar_aa))
-        C_bar_ab = np.matmul(U_bar_aa.transpose(0, 1, 3, 2), np.matmul(C_ab, U_bar_bb))
-        C_bar_bb = np.matmul(U_bar_bb.transpose(0, 1, 3, 2), np.matmul(C_bb, U_bar_bb))
-        C_bar_ba = np.matmul(U_bar_bb.transpose(0, 1, 3, 2), np.matmul(C_ba, U_bar_aa))
-        C_bar = np.append(
-            np.append(C_bar_aa, C_bar_ab, axis=3), np.append(C_bar_ba, C_bar_bb, axis=3), axis=2
-        )
-
-        return C_bar, U_bar_aa, U_bar_bb
-
-    def compute_e(self, csd, n_seeds):
-        """Computes E as the imaginary part of the transformed cross-spectra D
-        derived from the original cross-spectra "csd" between the seed and target
-        signals."""
-        # Equation 3
-        n_times = csd.shape[0]
-        n_freqs = csd.shape[1]
-        T = np.zeros(csd.shape)
-        # No clear way to do this without list comprehension (function only accepts square matrices)
-        # Could be a good place for parallelisation
-        # real(C_aa)^-1/2
-        T[:, :, :n_seeds, :n_seeds] = np.array([[spla.fractional_matrix_power(
-            np.real(csd[time_i, freq_i, :n_seeds, :n_seeds]), -0.5
-        ) for freq_i in range(n_freqs)] for time_i in range(n_times)])
-        # real(C_bb)^-1/2
-        T[:, :, n_seeds:, n_seeds:] = np.array([[spla.fractional_matrix_power(
-            np.real(csd[time_i, freq_i, n_seeds:, n_seeds:]), -0.5
-        ) for freq_i in range(n_freqs)] for time_i in range(n_times)])
-
-        # Equation 4
-        D = np.matmul(T, np.matmul(csd, T))
-
-        # E as the imaginary part of D between seeds and targets
-        E = np.imag(D[:, :, :n_seeds, n_seeds:])
-
-        return E
-
-
-class _MultivarGCEstBase(_EpochMeanMultivarConEstBase):
-    """Base Estimator for Granger causality multivariate methods."""
-
-    def __init__(self, n_signals, n_cons, n_freqs, n_times, n_lags):
-        super(_MultivarGCEstBase, self).__init__(
-            n_signals, n_cons, n_freqs, n_times
-        )
-
-        if n_lags:
-            if n_lags >= (self.n_freqs - 1) * 2:
-                raise ValueError(
-                    f"The number of lags ({n_lags}) must be less than double "
-                    "the frequency resolution of the cross-spectral density "
-                    f"({(self.n_freqs - 1) * 2})."
-                )
-            self.n_lags = n_lags
-        else:
-            self.n_lags = self.n_freqs - 2 # freq. resolution - 1
-
-    def compute_con(self, seeds, targets, n_epochs):
-        """Computes Granger causality between sets of signals."""
-        csd = self.reshape_csd()/n_epochs
-        csd = csd.transpose(2, 3, 1, 0) # signals x signals x freqs x time
-
-        # GC from seeds -> targets (subtracting GC from targets -> seeds if
-        # self.net == True)
-        autocov = self.csd_to_autocov(csd, seeds, targets)
-        con_scores = self.autocov_to_gc(autocov, seeds, targets, self.net)
-
-        # GC from seeds -> targets (subtracting GC from targets -> seeds if
-        # self.net == True), subtracting GC from time-reversed seeds -> targets
-        # (subtracting GC from time-reversed targets -> seeds if self.net ==
-        # True)
-        if self.time_reversed:
-            autocov_time_rev = [
-                np.transpose(con_autocov, (1, 0, 2, 3)) for con_autocov in autocov
-            ]
-            con_scores -= self.autocov_to_gc(
-                autocov_time_rev, seeds, targets, self.net
-            )
-
-        self.con_scores = con_scores
-        self.reshape_con_scores()
-
-    def csd_to_autocov(
-        self, csd, seeds, targets
-    ):
-        """Computes the autocovariance sequence from the cross-spectral
-        density."""
-        n_times = csd.shape[3]
-        autocov = [[]*len(seeds)]
-        for group_i, seed_idcs, target_idcs in zip(
-            range(len(seeds)), seeds, targets
-        ):
-            all_idcs = [*seed_idcs, *target_idcs]
-            n_signals = len(all_idcs)
-            autocov[group_i] = np.zeros(
-                (n_signals, n_signals, self.n_lags + 1, n_times)
-            )
-            con_csd = csd[
-                np.ix_(all_idcs, all_idcs, np.arange(self.n_freqs), np.arange(n_times))
-            ]
-            for time_i in range(n_times):
-                circular_shifted_csd = np.concatenate(
-                    [np.flip(np.conj(con_csd[:, :, 1:, time_i]), axis=2),
-                    con_csd[:, :, :-1, time_i]],
-                    axis=2,
-                )
-                ifft_shifted_csd = self.block_ifft(
-                    circular_shifted_csd, (self.n_freqs - 1) * 2
-                )
-
-                lags_ifft_shifted_csd = np.reshape(
-                    ifft_shifted_csd[:, :, :self.n_lags + 1],
-                    (n_signals ** 2, self.n_lags + 1),
-                    order="F"
-                )
-                signs = [1] * (self.n_lags + 1)
-                signs[1::2] = [x * -1 for x in signs[1::2]]
-                sign_matrix = np.tile(
-                    np.asarray(signs), (n_signals ** 2, 1)
-                )
-
-                autocov[group_i][:, :, :, time_i] += (np.real(np.reshape(
-                            sign_matrix * lags_ifft_shifted_csd,
-                            (n_signals, n_signals, self.n_lags + 1),
-                            order="F"))
-                )
-
-        return autocov
-
-    def block_ifft(self, csd, n_points):
-        """Performs a 'block' inverse fast Fourier transform on the data,
-        involving an n-point inverse Fourier transform."""
-        csd_2d = np.reshape(
-            csd, (csd.shape[0] * csd.shape[1], csd.shape[2]), order="F"
-        ).T
-        csd_ifft = np.fft.ifft(csd_2d, n=n_points, axis=0).T
-
-        return np.reshape(csd_ifft, csd.shape, order="F")
-
-    def autocov_to_gc(self, autocov, seeds, targets, net):
-        """Computes frequency-domain multivariate Granger causality from an
-        autocovariance sequence."""
-        n_times = autocov[0].shape[3]
-        con_scores = np.zeros((len(seeds), self.n_freqs, n_times))
-        for con_i, con_autocov in enumerate(autocov):
-            for time_i in range(n_times):
-                AF, V = self.autocov_to_full_var(con_autocov[:, :, :, time_i])
-                AF_2d = np.reshape(
-                    AF,
-                    (AF.shape[0], AF.shape[0] * AF.shape[2]),
-                    order="F"
-                )
-                A, K = self.full_var_to_iss(AF=AF_2d)
-
-                # GC from seeds -> targets
-                con_scores[con_i, :, time_i] = self.iss_to_usgc(
-                    A=A,
-                    C=AF_2d,
-                    K=K,
-                    V=V,
-                    seeds=seeds[con_i],
-                    targets=targets[con_i],
-                )
-
-                # GC from targets -> seeds
-                if net:
-                    con_scores[con_i, :, time_i] -= self.iss_to_usgc(
-                        A=A,
-                        C=AF_2d,
-                        K=K,
-                        V=V,
-                        seeds=targets[con_i],
-                        targets=seeds[con_i],
-                    )
-        
-        return con_scores
-
-    def autocov_to_full_var(self, autocov):
-        """Computes the full vector autoregressive (VAR) model from an
-        autocovariance sequence using Whittle's recursion.
-
-        Ref.: Whittle P., 1963. Biometrika, DOI: 10.1093/biomet/50.1-2.129.
-        """
-        AF, V = self.whittle_lwr_recursion(autocov)
-
-        if not np.isfinite(AF).all():
-            raise ValueError(
-                "Some or all VAR model coefficients are infinite or NaNs. "
-                "Please check the data you are computing Granger causality on."
-            )
-
-        try:
-            np.linalg.cholesky(V)
-        except np.linalg.linalg.LinAlgError as np_error:
-            raise ValueError(
-                "The residuals' covariance matrix is not positive-definite. "
-                "Make sure you are computing Granger causality only on data "
-                "that is full rank."
-            ) from np_error
-
-        return AF, V
-
-    def whittle_lwr_recursion(self, G):
-        """Calculates regression coefficients and the residuals' covariance
-        matrix from an autocovariance sequence by solving the Yule-Walker
-        equations using Whittle's recursive Levinson, Wiggins, Robinson (LWR)
-        algorithm.
-
-        Ref.: Whittle P., 1963. Biometrika, DOI: 10.1093/biomet/50.1-2.129.
-        """
-        ### Initialise recursion
-        n = G.shape[0]  # number of signals
-        q = G.shape[2] - 1  # number of lags
-        qn = n * q
-
-        G0 = G[:, :, 0]  # covariance
-        GF = (np.reshape(G[:, :, 1:], (n, qn), order="F").conj().T)  # forward
-        # autocovariance sequence
-        GB = np.reshape(
-            np.flip(G[:, :, 1:], 2).transpose((0, 2, 1)), (qn, n), order="F"
-        )  # backward autocovariance sequence
-
-        AF = np.zeros((n, qn))  # forward coefficients
-        AB = np.zeros((n, qn))  # backward coefficients
-
-        k = 1  # model order
-        r = q - k
-        kf = np.arange(k * n)  # forward indices
-        kb = np.arange(r * n, qn)  # backward indices
-
-        # equivalent to A/B or linsolve(B',A',opts.TRANSA=true)' in MATLAB
-        AF[:, kf] = spla.solve(
-            G0.conj().T, GB[kb, :].conj().T, transposed=True
-        ).conj().T
-        AB[:, kb] = spla.solve(
-            G0.conj().T, GF[kf, :].conj().T, transposed=True
-        ).conj().T
-
-        ### Perform recursion
-        for k in np.arange(2, q + 1):
-            # equivalent to A/B or linsolve(B',A',opts.TRANSA=true)' in MATLAB
-            var_A = GB[(r - 1) * n : r * n, :] - np.matmul(AF[:, kf], GB[kb, :])
-            var_B = G0 - np.matmul(AB[:, kb], GB[kb, :])
-            AAF = spla.solve(var_B, var_A.conj().T, transposed=True).conj().T
-            var_A = GF[(k - 1) * n : k * n, :] - np.matmul(AB[:, kb], GF[kf, :])
-            var_B = G0 - np.matmul(AF[:, kf], GF[kf, :])
-            AAB = spla.solve(var_B, var_A.conj().T, transposed=True).conj().T
-
-            AF_previous = AF[:, kf]
-            AB_previous = AB[:, kb]
-
-            r = q - k
-            kf = np.arange(k * n)
-            kb = np.arange(r * n, qn)
-
-            AF[:, kf] = np.hstack(
-                (AF_previous - np.matmul(AAF, AB_previous), AAF)
-            )
-            AB[:, kb] = np.hstack(
-                (AAB, AB_previous - np.matmul(AAB, AF_previous))
-            )
-
-        V = G0 - np.matmul(AF, GF)
-        AF = np.reshape(AF, (n, n, q), order="F")
-
-        return AF, V
-
-    def full_var_to_iss(self, AF):
-        """Computes innovations-form parameters for a state-space model from a
-        full vector autoregressive (VAR) model using Aoki's method.
-
-        For a non-moving-average full VAR model, the state-space parameter C
-        (observation matrix) is identical to AF of the VAR model.
-
-        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        m = AF.shape[0]  # number of signals
-        p = AF.shape[1] // m  # number of autoregressive lags
-
-        Ip = np.eye(m * p)
-        # state transition matrix
-        A = np.vstack((AF, Ip[: (len(Ip) - m), :]))
-        # Kalman gain matrix
-        K = np.vstack((np.eye(m), np.zeros(((m * (p - 1)), m))))
-
-        return A, K
-
-    def iss_to_usgc(self, A, C, K, V, seeds, targets):
-        """Computes unconditional spectral Granger causality from
-        innovations-form state-space model parameters.
-
-        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        f = np.zeros(self.n_freqs) # placeholder for GC results
-        z = np.exp(-1j * np.pi * np.linspace(0, 1, self.n_freqs)) # points on a
-            # unit circle in the complex plane, one for each frequency
-        H = self.iss_to_tf(A, C, K, z) # spectral transfer function
-        V_sqrt = np.linalg.cholesky(V)
-        PV_sqrt = np.linalg.cholesky(self.partial_covar(V, seeds, targets))
-
-        for freq_i in range(self.n_freqs):
-            HV = np.matmul(H[:, :, freq_i], V_sqrt)
-            S = np.matmul(HV, HV.conj().T) # CSD of the projected state
-                # variable (Eq. 6)
-            S_tt = S[np.ix_(targets, targets)] # CSD between targets
-            if len(PV_sqrt) == 1:
-                HV_ts = H[targets, seeds, freq_i] * PV_sqrt
-                HVH_ts = np.outer(HV_ts, HV_ts.conj().T)
-            else:
-                HV_ts = np.matmul(
-                    H[np.ix_(targets, seeds)][:, :, freq_i], PV_sqrt
-                )
-                HVH_ts = np.matmul(HV_ts, HV_ts.conj().T)
-            if len(targets) == 1:
-                numerator = np.real(S_tt)
-                denominator = np.real(S_tt - HVH_ts)
-            else:
-                numerator = np.real(np.linalg.det(S_tt))
-                denominator = np.real(np.linalg.det(S_tt - HVH_ts))
-            f[freq_i] = np.log(numerator) - np.log(denominator) # Eq. 11
-
-        return f
-
-    def iss_to_tf(self, A, C, K, z):
-        """Computes a transfer function (moving-average representation) for
-        innovations-form state-space model parameters.
-
-        In the frequency domain, the back-shift operator, z, is a vector of
-        points on a unit circle in the complex plane. z = e^-iw, where -pi < w
-        <= pi.
-
-        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        h = self.n_freqs
-        n = C.shape[0]
-        m = A.shape[0]
-        I_n = np.eye(n)
-        I_m = np.eye(m)
-        H = np.zeros((n, n, h), dtype=np.complex128)
-
-        # compute transfer function; Eq. 4
-        for k in range(h):
-            H[:, :, k] = I_n + np.matmul(
-                C, spla.lu_solve(spla.lu_factor(z[k] * I_m - A), K)
-            )
-
-        return H
-
-    def partial_covar(self, V, seeds, targets):
-        """Computes the partial covariance of a matrix.
-
-        Given a covariance matrix V, the partial covariance matrix of V between
-        indices i and j, given k (V_ij|k), is equivalent to
-        V_ij - V_ik * V_kk^-1 * V_kj. In this case, i and j are seeds, and k is
-        the targets.
-
-        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
-        10.1103/PhysRevE.91.040101.
-        """
-        if len(targets) == 1:
-            W = (1 / np.sqrt(V[targets, targets])) * V[targets, seeds]
-            W = np.outer(W.conj().T, W)
-        else:
-            W = np.linalg.solve(
-                np.linalg.cholesky(V[np.ix_(targets, targets)]),
-                V[np.ix_(targets, seeds)],
-            )
-            W = W.conj().T.dot(W)
-
-        return V[np.ix_(seeds, seeds)] - W
 
 
 class _CohEst(_CohEstBase):
@@ -560,123 +178,637 @@ class _ImCohEst(_CohEstBase):
         csd_mean = self._acc[con_idx] / n_epochs
         self.con_scores[con_idx] = np.imag(csd_mean) / np.sqrt(psd_xx * psd_yy)
 
-class _MIMEst(_MultivarCohEstBase):
-    """Estimator for MIM (multivariate interaction measure)"""
 
-    name = "MIM"
-    accumulate_psd = False
+class _MultivarCohEstBase(_EpochMeanMultivarConEstBase):
+    """Base estimator for maximised imaginary coherence and multivariate
+    interaction measure."""
+
+    compute_mic = False
+    compute_mim = False
+
+    accepted_form_names = ['MIC & MIM', 'MIC', 'MIM']
+
+    def __init__(self, n_signals, n_cons, n_freqs, n_times, n_jobs=1):
+        super(_MultivarCohEstBase, self).__init__(
+            n_signals, n_cons, n_freqs, n_times, n_jobs
+        )
+
+        self.mic_scores = copy.deepcopy(self.con_scores)
+        self.mim_scores = copy.deepcopy(self.con_scores)
 
     def compute_con(
-        self, seeds, targets, n_seed_components, n_target_components, n_epochs
+        self, seeds, targets, n_seed_components, n_target_components, n_epochs,
+        form_name
     ):
-        """Computes the multivariate interaction measure between two sets of
-        signals"""
+        """Computes MIC and/or MIM between sets of signals."""  
+        self._sort_form_name(form_name)
+
         csd = self.reshape_csd()/n_epochs
         n_times = csd.shape[0]
-        node_i = 0
+
+        con_i = 0
         for seed_idcs, target_idcs in zip(seeds, targets):
+            self._log_connection_number(con_i, f'coherence ({form_name})')
+
             n_seeds = len(seed_idcs)
-            node_idcs = [*seed_idcs, *target_idcs]
-            node_csd = csd[np.ix_(np.arange(n_times), np.arange(self.n_freqs), node_idcs, node_idcs)]
+            con_idcs = [*seed_idcs, *target_idcs]
+            C = csd[np.ix_(
+                np.arange(n_times), np.arange(self.n_freqs), con_idcs, con_idcs
+            )]
 
             # Eqs. 32 & 33
-            C_bar, U_bar_aa, _ = self.cross_spectra_svd(
-                csd=node_csd,
+            C_bar, U_bar_aa, U_bar_bb = self._cross_spectra_svd(
+                csd=C,
                 n_seeds=n_seeds,
-                n_seed_components=n_seed_components[node_i],
-                n_target_components=n_target_components[node_i],
+                n_seed_components=n_seed_components[con_i],
+                n_target_components=n_target_components[con_i],
             )
 
             # Eqs. 3 & 4
-            E = self.compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[2])
+            E = self._compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[3])
 
-            # Equation 14
-            self.con_scores[node_i, :, :] = np.matmul(E, E.transpose(0, 1, 3, 2)).trace(axis1=2, axis2=3).transpose(1, 0)
-            node_i += 1
-        self.reshape_con_scores()
+            if self.compute_mic:
+                self._compute_mic(
+                    E, C, n_seeds, n_times, U_bar_aa, U_bar_bb, con_i
+                )
+
+            if self.compute_mim:
+                self._compute_mim(E, con_i)
+
+            con_i += 1
+
+        self.reshape_results()
+
+    def _sort_form_name(self, form_name):
+        """Checks that the form name of the connectivity being computed is
+        appropriate and sets associated class attributes accordingly."""
+        assert form_name in self.accepted_form_names, (
+            'The requested form of multivariate coherence is not recognised by '
+            'the connectivity class. Please contact the mne-connectivity '
+            'developers.'
+        )
+
+        if form_name == 'MIC & MIM':
+            self.compute_mic = True
+            self.compute_mim = True
+        elif form_name == 'MIC':
+            self.compute_mic = True
+        else: # only MIM left
+            self.compute_mim = True
+        
+        if self.compute_mic:
+            self.topographies = np.empty((2, self.n_cons), dtype=object)
+
+    def _cross_spectra_svd(
+        self, csd, n_seeds, n_seed_components, n_target_components
+    ):
+        """Performs dimensionality reduction on a cross-spectral density using
+        singular value decomposition (SVD)."""
+        n_times = csd.shape[0]
+        n_targets = csd.shape[2]-n_seeds
+        C_aa = csd[:, :, :n_seeds, :n_seeds]
+        C_ab = csd[:, :, :n_seeds, n_seeds:]
+        C_bb = csd[:, :, n_seeds:, n_seeds:]
+        C_ba = csd[:, :, n_seeds:, :n_seeds]
+
+        # Eq. 32
+        if n_seed_components is not None:
+            U_aa = np.linalg.svd(np.real(C_aa), full_matrices=False)[0]
+            U_bar_aa = U_aa[:, :, :, :n_seed_components]
+        else:
+            U_bar_aa = np.broadcast_to(np.identity(n_seeds), (n_times, self.n_freqs)+(n_seeds, n_seeds))
+        if n_target_components is not None:
+            U_bb = np.linalg.svd(np.real(C_bb), full_matrices=False)[0]
+            U_bar_bb = U_bb[:, :, :, :n_target_components]
+        else:
+            U_bar_bb = np.broadcast_to(np.identity(n_targets), (n_times, self.n_freqs)+(n_targets, n_targets))
+
+        # Eq. 33
+        C_bar_aa = U_bar_aa.transpose(0, 1, 3, 2) @ (C_aa @ U_bar_aa)
+        C_bar_ab = U_bar_aa.transpose(0, 1, 3, 2) @ (C_ab @ U_bar_bb)
+        C_bar_bb = U_bar_bb.transpose(0, 1, 3, 2) @ (C_bb @ U_bar_bb)
+        C_bar_ba = U_bar_bb.transpose(0, 1, 3, 2) @ (C_ba @ U_bar_aa)
+        C_bar = np.append(
+            np.append(C_bar_aa, C_bar_ab, axis=3), np.append(C_bar_ba, C_bar_bb, axis=3), axis=2
+        )
+
+        return C_bar, U_bar_aa, U_bar_bb
+
+    def _compute_e(self, csd, n_seeds):
+        """Computes E as the imaginary part of the transformed cross-spectra D
+        derived from the original cross-spectra "csd" between the seed and target
+        signals."""
+        # Equation 3
+        real_csd = np.real(csd)
+
+        parallel, parallel_compute_t, _ = parallel_func(
+            _compute_t, self.n_jobs, verbose=False
+        )
+        T = np.zeros(csd.shape, dtype=np.complex128).transpose(1, 0, 2, 3)
+        for block_i in ProgressBar(
+            range(self.n_steps), mesg='frequency blocks'
+        ):
+            freqs = self._get_block_indices(block_i, self.n_freqs)
+            T[freqs] = parallel(
+                parallel_compute_t(real_csd[:, f, :, :], n_seeds)
+                for f in freqs
+            )
+        T = T.transpose(1, 0, 2, 3)
+
+        if not np.isreal(T).all() or not np.isfinite(T).all():
+            raise ValueError(
+                'the transformation matrix of the data must be real-valued and '
+                'contain no NaN or infinity values; check that you are using '
+                'full rank data or specify an appropriate number of components '
+                'for the seeds and targets that is less than or equal to their '
+                'ranks'
+            )
+        T = np.real(T)
+
+        # Equation 4
+        D = T @ (csd @ T)
+
+        # E as the imaginary part of D between seeds and targets
+        E = np.imag(D[:, :, :n_seeds, n_seeds:])
+
+        return E
+
+    def _compute_mic(self, E, C, n_seeds, n_times, U_bar_aa, U_bar_bb, con_i):
+        """Computes and stores MIC using E, and the topographies using the CSD
+        and SVD derivatives."""
+        # Weights for signals in the groups
+        w_a, V_a = np.linalg.eigh(E @ E.transpose(0, 1, 3, 2))
+        w_b, V_b = np.linalg.eigh(E.transpose(0, 1, 3, 2) @ E)
+        alpha = V_a[
+            np.arange(n_times)[:, None], np.arange(self.n_freqs), :,
+            w_a.argmax(axis=2)
+        ]
+        beta = V_b[
+            np.arange(n_times)[:, None], np.arange(self.n_freqs), :,
+            w_b.argmax(axis=2)
+        ]
+
+        # Eqs. 46 & 47
+        self.topographies[0][con_i] = np.abs(
+            np.real(C[:, :, :n_seeds, :n_seeds]) @ 
+            (U_bar_aa @ np.expand_dims(alpha, 3))
+        )[:, :, :, 0].T
+        self.topographies[1][con_i] = np.abs(
+            np.real(C[:, :, n_seeds:, n_seeds:]) @ 
+            (U_bar_bb @ np.expand_dims(beta, 3))
+        )[:, :, :, 0].T
+
+        # Eq. 7
+        self.mic_scores[con_i, :, :] = np.abs(
+            np.einsum(
+                "ijk,ijk->ij", alpha, (E @ np.expand_dims(beta, 3))[:, :, :, 0]
+            ) / np.linalg.norm(alpha, axis=2) * np.linalg.norm(beta, axis=2)
+        ).T
+    
+    def _compute_mim(self, E, con_i):
+        """Computes and stores MIM results using E."""
+        # Eq. 14
+        self.mim_scores[con_i, :, :] = (
+            E @ E.transpose(0, 1, 3, 2)
+        ).trace(axis1=2, axis2=3).T
+    
+    def reshape_results(self):
+        """Removes the time dimension from con. scores and topographies, if
+        necessary."""
+        if self.n_times == 0:
+            self.mic_scores = self.mic_scores[:, :, 0]
+            self.mim_scores = self.mim_scores[:, :, 0]
+
+            if self.topographies is not None:
+                for group_i in range(2):
+                    for con_i in range(self.n_cons):
+                        self.topographies[group_i][con_i] = (
+                            self.topographies[group_i][con_i][:, :, 0]
+                        )
+
+def _compute_t(csd, n_seeds):
+    """Compute T for a single frequency as the real-valued cross-spectra of
+    seeds and targets to the power -0.5."""
+    T = np.zeros_like(csd, dtype=np.complex128)
+    for time_i in range(csd.shape[0]):
+        T[time_i, :n_seeds, :n_seeds] = spla.fractional_matrix_power(
+            csd[time_i, :n_seeds, :n_seeds], -0.5
+        ) # real(C_aa)^-1/2
+        T[time_i, n_seeds:, n_seeds:] = spla.fractional_matrix_power(
+            csd[time_i, n_seeds:, n_seeds:], -0.5
+        ) # real(C_bb)^-1/2
+    
+    return T
 
 
 class _MICEst(_MultivarCohEstBase):
-    """Estimator for MIC (maximized imaginary coherence)"""
+    """Maximised imaginary coherence estimator."""
 
-    name = "MIC"
-    accumulate_psd = False
+    name = 'MIC'
+
+
+class _MIMEst(_MultivarCohEstBase):
+    """Multivariate interaction measure estimator."""
+
+    name = 'MIM'
+
+
+class _GCEstBase(_EpochMeanMultivarConEstBase):
+    """Base Granger causality estimator."""
+
+    autocov = None
+
+    def __init__(self, n_signals, n_cons, n_freqs, n_times, n_lags, n_jobs=1):
+        super(_GCEstBase, self).__init__(
+            n_signals, n_cons, n_freqs, n_times, n_jobs
+        )
+
+        if n_lags >= (self.n_freqs - 1) * 2:
+            raise ValueError(
+                f'the number of lags ({n_lags}) must be less than double the '
+                'frequency resolution of the cross-spectral density '
+                f'({(self.n_freqs - 1) * 2}).'
+            )
+        self.n_lags = n_lags
+
+    def compute_autocov(self, n_epochs):
+        """Computes the autocovariance sequence from the CSD in preparation for
+        computing connectivity."""
+        self.autocov = self.csd_to_autocov(self.reshape_csd()/n_epochs)
+
+    def csd_to_autocov(self, csd):
+        """Computes the autocovariance sequence from the cross-spectral
+        density."""
+        n_times = csd.shape[0]
+        circular_shifted_csd = np.concatenate(
+            [np.flip(np.conj(csd[:, 1:, :, :]), axis=1),
+            csd[:, :-1, :, :]],
+            axis=1,
+        )
+        ifft_shifted_csd = self.block_ifft(
+            circular_shifted_csd, (self.n_freqs - 1) * 2
+        )
+        lags_ifft_shifted_csd = np.reshape(
+            ifft_shifted_csd[:, :self.n_lags + 1, :, :],
+            (n_times, self.n_lags + 1, self.n_signals ** 2),
+            order="F"
+        )
+
+        signs = [1] * (self.n_lags + 1)
+        signs[1::2] = [x * -1 for x in signs[1::2]]
+        sign_matrix = np.repeat(
+            np.tile(
+                np.asarray(signs), (self.n_signals ** 2, 1)
+            )[np.newaxis, :, :],
+            n_times,
+            axis=0
+        ).transpose(0, 2, 1)
+
+        return (
+            np.real(
+                np.reshape(
+                    sign_matrix * lags_ifft_shifted_csd,
+                    (n_times, self.n_lags + 1, self.n_signals, self.n_signals),
+                    order="F"
+                )
+            )
+        )
+
+    def block_ifft(self, csd, n_points):
+        """Performs a 'block' inverse fast Fourier transform on the data,
+        involving an n-point inverse Fourier transform."""
+        csd_3d = np.reshape(
+            csd,
+            (csd.shape[0], csd.shape[1], csd.shape[2] * csd.shape[3]),
+            order="F"
+        )
+        csd_ifft = np.fft.ifft(csd_3d, n=n_points, axis=1)
+
+        return np.reshape(csd_ifft, csd.shape, order="F")
 
     def compute_con(
-        self, seeds, targets, n_seed_components, n_target_components, n_epochs
+        self, seeds, targets, flip_seeds_targets, reverse_time, form_name
     ):
-        """Computes maximized imaginary coherence between sets of signals."""
-        csd = self.reshape_csd()/n_epochs
-        n_times = csd.shape[0]
-        node_i = 0
-        for seed_idcs, target_idcs in zip(seeds, targets):
-            n_seeds = len(seed_idcs)
-            node_idcs = [*seed_idcs, *target_idcs]
-            node_csd = csd[np.ix_(np.arange(n_times), np.arange(self.n_freqs), node_idcs, node_idcs)]
+        """Computes Granger causality between sets of signals."""
+        seeds, targets = self._sort_inputs(
+            seeds, targets, flip_seeds_targets, reverse_time
+        )
 
-            # Eqs. 32 & 33
-            C_bar, U_bar_aa, _ = self.cross_spectra_svd(
-                csd=node_csd,
-                n_seeds=n_seeds,
-                n_seed_components=n_seed_components[node_i],
-                n_target_components=n_target_components[node_i],
+        con_i = 0
+        for con_seeds, con_targets in zip(seeds, targets):
+            self._log_connection_number(con_i, f'GC ({form_name})')
+
+            self.con_scores[con_i] = self.autocov_to_gc(con_seeds, con_targets)
+
+            con_i += 1
+
+        self.reshape_results()
+
+    def _sort_inputs(self, seeds, targets, flip_seeds_targets, reverse_time):
+        """Actions the input parameters (swap seeds and targets and reverses
+        time direction)."""
+        if not flip_seeds_targets:
+            # standard GC from seeds -> targets
+            output = (seeds, targets)
+        else:
+            # GC from targets -> seeds (used for computing net GC & net TRGC)
+            output = (targets, seeds)
+
+        if reverse_time:
+            # GC from seeds -> targets (or targets -> seeds) with time reversed
+            # by transposing the signal dimensions of the autocovariance
+            # sequence (used for computing TRGC and net TRGC)
+            self.autocov = self.autocov.transpose(0, 1, 3, 2)
+        
+        return output
+
+    def autocov_to_gc(self, con_seeds, con_targets):
+        """Computes frequency-domain multivariate Granger causality from an
+        autocovariance sequence."""
+        n_times = self.autocov.shape[0]
+        lags = np.arange(self.autocov.shape[1])
+        times = np.arange(n_times)
+
+        con_idcs = [*con_seeds, *con_targets]
+        con_autocov = self.autocov[np.ix_(times, lags, con_idcs, con_idcs)]
+        new_seeds = np.arange(len(con_seeds))
+        new_targets = np.arange(len(con_targets))+len(con_seeds)
+
+        A_f, V = self.autocov_to_full_var(con_autocov)
+        A_f_3d = np.reshape(
+            A_f,
+            (n_times, self.n_signals, self.n_signals * self.n_lags),
+            order="F"
+        )
+        A, K = self.full_var_to_iss(A_f_3d)
+        
+        return self.iss_to_usgc(
+            A=A, C=A_f_3d, K=K, V=V, seeds=new_seeds, targets=new_targets,
+        )
+
+    def autocov_to_full_var(self, autocov):
+        """Computes the full vector autoregressive (VAR) model from an
+        autocovariance sequence using Whittle's recursion.
+
+        Ref.: Whittle P., 1963. Biometrika, DOI: 10.1093/biomet/50.1-2.129.
+        """
+        if np.any(np.linalg.det(autocov) == 0):
+            raise ValueError(
+                'the autocovariance matrix is singular; make sure you are '
+                'using only full rank data, or specify an appropriate number '
+                'of components for the seeds and targets that is less than or '
+                'equal to their ranks'
             )
 
-            # Eqs. 3 & 4
-            E = self.compute_e(csd=C_bar, n_seeds=U_bar_aa.shape[2])
+        A_f, V = self.whittle_lwr_recursion(autocov)
 
-            # Weights for signals in the groups
-            w_a, V_a = np.linalg.eigh(np.matmul(E, E.transpose(0, 1, 3, 2)))
-            w_b, V_b = np.linalg.eigh(np.matmul(E.transpose(0, 1, 3, 2), E))
-            alpha = V_a[np.arange(n_times)[:, None], np.arange(self.n_freqs), :, w_a.argmax(axis=2)]
-            beta = V_b[np.arange(n_times)[:, None], np.arange(self.n_freqs), :, w_b.argmax(axis=2)]
+        if not np.isfinite(A_f).all():
+            raise ValueError(
+                'some or all VAR model coefficients are infinite or NaNs; '
+                'please check the data you are computing connectivity on'
+            )
 
-            # Eq. 7
-            self.con_scores[node_i, :, :] = (np.einsum(
-                "ijk,ijk->ij",
-                alpha,
-                np.matmul(E, np.expand_dims(beta, 3))[:, :, :, 0]) / np.linalg.norm(alpha, axis=2) * np.linalg.norm(beta, axis=2)
-            ).transpose(1, 0)
-            node_i += 1
-        self.reshape_con_scores()
+        try:
+            np.linalg.cholesky(V)
+        except np.linalg.linalg.LinAlgError as np_error:
+            raise ValueError(
+                'the residuals covariance matrix is not positive-definite; '
+                'make sure you are using only full rank data, or specify an '
+                'appropriate number of components for the seeds and targets '
+                'that is less than or equal to their ranks'
+            ) from np_error
+
+        return A_f, V
+
+    def whittle_lwr_recursion(self, G):
+        """Calculates regression coefficients and the residuals' covariance
+        matrix from an autocovariance sequence by solving the Yule-Walker
+        equations using Whittle's recursive Levinson, Wiggins, Robinson (LWR)
+        algorithm.
+
+        Ref.: Whittle P., 1963. Biometrika, DOI: 10.1093/biomet/50.1-2.129.
+        """
+        ### Initialise recursion
+        n = G.shape[2]  # number of signals
+        q = G.shape[1] - 1  # number of lags
+        t = G.shape[0]  # number of times
+        qn = n * q
+
+        cov = G[:, 0, :, :]  # covariance
+        G_f = np.reshape(
+            G[:, 1:, :, :].transpose(0, 3, 1, 2), (t, qn, n), order="F"
+        )  # forward autocovariance sequence
+        G_b = np.reshape(
+            np.flip(G[:, 1:, :, :], 1).transpose(0, 3, 2, 1), (t, n, qn),
+            order="F"
+        ).transpose(0, 2, 1)  # backward autocovariance sequence
+            
+        A_f = np.zeros((t, n, qn))  # forward coefficients
+        A_b = np.zeros((t, n, qn))  # backward coefficients
+
+        k = 1  # model order
+        r = q - k
+        k_f = np.arange(k * n)  # forward indices
+        k_b = np.arange(r * n, qn)  # backward indices
+
+        A_f[:, :, k_f] = np.linalg.solve(
+            cov, G_b[:, k_b, :].transpose(0, 2, 1)
+        ).transpose(0, 2, 1) 
+        A_b[:, :, k_b] = np.linalg.solve(
+            cov, G_f[:, k_f, :].transpose(0, 2, 1)
+        ).transpose(0, 2, 1)
+
+        ## Perform recursion
+        for k in np.arange(2, q + 1):
+            var_A = (
+                G_b[:, (r - 1) * n : r * n, :] -
+                (A_f[:, :, k_f] @ G_b[:, k_b, :])
+            )
+            var_B = cov - (A_b[:, :, k_b] @ G_b[:, k_b, :])
+            AA_f = np.linalg.solve(
+                var_B, var_A.transpose(0, 2, 1)
+            ).transpose(0, 2, 1)
+            var_A = (
+                G_f[:, (k - 1) * n : k * n, :] -
+                (A_b[:, :, k_b] @ G_f[:, k_f, :])
+            )
+            var_B = cov - (A_f[:, :, k_f] @ G_f[:, k_f, :])
+            AA_b = np.linalg.solve(
+                var_B, var_A.transpose(0, 2, 1)
+            ).transpose(0, 2, 1)
+
+            A_f_previous = A_f[:, :, k_f]
+            A_b_previous = A_b[:, :, k_b]
+
+            r = q - k
+            k_f = np.arange(k * n)
+            k_b = np.arange(r * n, qn)
+
+            A_f[:, :, k_f] = np.dstack(
+                (A_f_previous - (AA_f @ A_b_previous), AA_f)
+            )
+            A_b[:, :, k_b] = np.dstack(
+                (AA_b, A_b_previous - (AA_b @ A_f_previous))
+            )
+
+        V = cov - (A_f @ G_f)
+        A_f = np.reshape(A_f, (t, n, n, q), order="F")
+
+        return A_f, V
+
+    def full_var_to_iss(self, A_f):
+        """Computes innovations-form parameters for a state-space model from a
+        full vector autoregressive (VAR) model using Aoki's method.
+
+        For a non-moving-average full VAR model, the state-space parameter C
+        (observation matrix) is identical to AF of the VAR model.
+
+        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
+        10.1103/PhysRevE.91.040101.
+        """
+        t = A_f.shape[0]
+        m = A_f.shape[1]  # number of signals
+        p = A_f.shape[2] // m  # number of autoregressive lags
+
+        I_p = np.dstack(t * [np.eye(m * p)]).transpose(2, 0, 1)
+        A = np.hstack((A_f, I_p[:, : (m * p - m), :]))  # state transition
+        # matrix
+        K = np.hstack((
+            np.dstack(t * [np.eye(m)]).transpose(2, 0, 1),
+            np.zeros((t, (m * (p - 1)), m))
+        ))  # Kalman gain matrix
+
+        return A, K
+
+    def iss_to_usgc(self, A, C, K, V, seeds, targets):
+        """Computes unconditional spectral Granger causality from
+        innovations-form state-space model parameters.
+
+        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
+        10.1103/PhysRevE.91.040101.
+        """
+        times = np.arange(A.shape[0])
+        freqs = np.arange(self.n_freqs)
+        z = np.exp(-1j * np.pi * np.linspace(0, 1, self.n_freqs))  # points
+        # on a unit circle in the complex plane, one for each frequency
+
+        H = self.iss_to_tf(A, C, K, z)  # spectral transfer function
+        V_22_1 = np.linalg.cholesky(self.partial_covar(V, seeds, targets))
+        HV = H @ np.linalg.cholesky(V)
+        S = HV @ HV.conj().transpose(0, 1, 3, 2)  # Eq. 6
+        S_11 = S[np.ix_(freqs, times, targets, targets)]
+        HV_12 = H[np.ix_(freqs, times, targets, seeds)] @ V_22_1
+        HVH = HV_12 @ HV_12.conj().transpose(0, 1, 3, 2)
+        
+        return np.real(
+            np.log(np.linalg.det(S_11)) -
+            np.log(np.linalg.det(S_11 - HVH))
+        )  # Eq. 11
+
+    def iss_to_tf(self, A, C, K, z):
+        """Computes a transfer function (moving-average representation) for
+        innovations-form state-space model parameters.
+
+        In the frequency domain, the back-shift operator, z, is a vector of
+        points on a unit circle in the complex plane. z = e^-iw, where -pi < w
+        <= pi.
+
+        A note on efficiency: solving over the 4D time-freq. tensor is slower
+        than looping over times and freqs when n_times and n_freqs high, and
+        when n_times and n_freqs low, looping over times and freqs very fast
+        anyway (plus tensor solving doesn't allow for parallelisation).
+
+        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
+        10.1103/PhysRevE.91.040101.
+        """
+        t = A.shape[0]
+        h = self.n_freqs
+        n = C.shape[1]
+        m = A.shape[1]
+        I_n = np.eye(n)
+        I_m = np.eye(m)
+        H = np.zeros((h, t, n, n), dtype=np.complex128)
+
+        parallel, parallel_compute_H, _ = parallel_func(
+            _compute_H, self.n_jobs, verbose=False
+        )
+        H = np.zeros((h, t, n, n), dtype=np.complex128)
+        for block_i in ProgressBar(
+            range(self.n_steps), mesg='frequency blocks'
+        ):
+            freqs = self._get_block_indices(block_i, self.n_freqs)
+            H[freqs] = parallel(
+                parallel_compute_H(A, C, K, z[k], I_n, I_m) for k in freqs
+            )
+
+        return H
+
+    def partial_covar(self, V, seeds, targets):
+        """Computes the partial covariance of a matrix.
+
+        Given a covariance matrix V, the partial covariance matrix of V between
+        indices i and j, given k (V_ij|k), is equivalent to
+        V_ij - V_ik * V_kk^-1 * V_kj. In this case, i and j are seeds, and k is
+        the targets.
+
+        Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
+        10.1103/PhysRevE.91.040101.
+        """
+        times = np.arange(V.shape[0])
+        W = np.linalg.solve(
+            np.linalg.cholesky(V[np.ix_(times, targets, targets)]),
+            V[np.ix_(times, targets, seeds)],
+        )
+        W = W.transpose(0, 2, 1) @ W
+
+        return V[np.ix_(times, seeds, seeds)] - W
+    
+    def reshape_results(self):
+        """Removes the time dimension from con. scores, if
+        necessary."""
+        if self.n_times == 0:
+            self.con_scores = self.con_scores[:, :, 0]
+
+def _compute_H(A, C, K, z_k, I_n, I_m):
+    """Compute the spectral transfer function H for innovations-form state-space
+    model parameters according to Eq. 4 of the reference.
+    
+    Ref.: Barnett, L. & Seth, A.K., 2015, Physical Review, DOI:
+    10.1103/PhysRevE.91.040101.
+    """
+    H = np.zeros((A.shape[0], C.shape[1], C.shape[1]), dtype=np.complex128)
+    for t in range(A.shape[0]):
+        H[t] = I_n + (C[t] @ spla.lu_solve(
+                spla.lu_factor(z_k * I_m - A[t]), K[t]
+        ))
+    
+    return H
 
 
-class _GCEst(_MultivarGCEstBase):
-    """GC Estimator; causality from: [seeds -> targets]."""
+class _GCEst(_GCEstBase):
+    """Granger causality ([seeds -> targets]) estimator."""
 
-    name = "GC"
-    accumulate_psd = False
-    net = False
-    time_reversed = False
+    name = 'GC'
 
 
-class _NetGCEst(_MultivarGCEstBase):
-    """Net GC Estimator; causality from: [seeds -> targets] - [targets ->
-    seeds]."""
+class _NetGCEst(_GCEstBase):
+    """Granger causality ([seeds -> targets] - [targets -> seeds]) estimator."""
 
-    name = "Net GC"
-    accumulate_psd = False
-    net = True
-    time_reversed = False
+    name = 'Net GC'
 
-class _TRGCEst(_MultivarGCEstBase):
-    """TRGC Estimator; causality from: [seeds -> targets] - time-reversed[seeds
-    -> targets]."""
 
-    name = "TRGC"
-    accumulate_psd = False
-    net = False
-    time_reversed = True
+class _TRGCEst(_GCEstBase):
+    """Granger causality (time-reversed[seeds -> targets]) estimator."""
 
-class _NetTRGCEst(_MultivarGCEstBase):
-    """Net TRGC Estimator; causality from: ([seeds -> targets] - [targets ->
-    seeds]) - (time-reversed[seeds -> targets] - time-reversed[targets ->
-    seeds])."""
+    name = 'TRGC'
 
-    name = "Net TRGC"
-    accumulate_psd = False
-    net = True
-    time_reversed = True
+
+class _NetTRGCEst(_GCEstBase):
+    """Granger causality (([seeds -> targets] - [targets -> seeds]) -
+    time-reversed([seeds -> targets] - targets -> seeds])) estimator."""
+
+    name = 'Net TRGC'
+
 
 class _PLVEst(_EpochMeanConEstBase):
     """PLV Estimator."""

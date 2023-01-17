@@ -543,7 +543,7 @@ class BaseConnectivity(DynamicMixin, EpochMixin):
                     f'should match the raveled data length passed '
                     f'in of {data_len}.')
 
-        elif indices == 'symmetric':
+        elif isinstance(indices, str) and indices == 'symmetric':
             expected_len = ((n_nodes + 1) * n_nodes) // 2
             if data_len != expected_len:
                 raise ValueError(f'If "indices" is "symmetric", then '
@@ -677,7 +677,8 @@ class BaseConnectivity(DynamicMixin, EpochMixin):
         _check_option('output', output, ['raveled', 'dense', 'compact'])
 
         if output == 'compact':
-            if self.indices in ['all', 'symmetric']:
+            if isinstance(self.indices, str) and \
+                self.indices in ['all', 'symmetric']:
                 output = 'dense'
             else:
                 output = 'raveled'
@@ -712,7 +713,7 @@ class BaseConnectivity(DynamicMixin, EpochMixin):
                     data[:, row_idx, col_idx, ...] = self._data
                 else:
                     data[row_idx, col_idx, ...] = self._data
-            elif self.indices == 'symmetric':
+            elif isinstance(self.indices, str) and self.indices == 'symmetric':
                 data = np.zeros(new_shape)
 
                 # get the upper/lower triangular indices
@@ -1037,6 +1038,370 @@ class EpochSpectroTemporalConnectivity(SpectroTemporalConnectivity):
             data, names=names, freqs=freqs, times=times, indices=indices,
             n_nodes=n_nodes, method=method, spec_method=spec_method,
             **kwargs)
+
+class BaseMultivariateConnectivity(BaseConnectivity):
+    """Base class for multivariate connectivity data.
+
+    This class should not be instantiated directly, but should be used
+    to do type-checking.
+    """
+
+    _pad_val = np.inf # used to pad ragged xarray attributes before saving
+    # until they are no longer ragged, at which point they can be saved with
+    # HDF5 (np.inf is chosen as it should not appear in the xarray attributes;
+    # if it is, an error will be raised when trying to save)
+
+    def _add_multivariate_attrs(self, topographies, n_components, n_lags):
+        """Add multivariate connectivity-specific attributes to the object."""
+        if topographies is not None:
+            self._check_topographies_consistency(topographies)
+        self.attrs['topographies'] = topographies
+
+        if n_components is not None:
+            self._check_n_components_consistency(n_components)
+        self.attrs['n_components'] = n_components
+
+        self.attrs['n_lags'] = n_lags
+
+    def _check_topographies_consistency(self, topographies):
+        """Perform topographies input checks."""
+        data = self.get_data()
+
+        if not isinstance(topographies, np.ndarray):
+            raise TypeError(
+                'Topographies must be passed in as a numpy array.'
+            )
+
+        for topographies_group in topographies:
+            for topo_data in topographies_group:
+                if topo_data.ndim not in [2, 3]:
+                    raise RuntimeError(
+                        'Topographies should have either 3 or 4 dimensions '
+                        '(connections, channels, frequencies, [timepoints]). '
+                        f'Your topographies have {topo_data.ndim + 1} '
+                        'dimensions.'
+                    )
+        
+        if len(topographies[0]) != len(topographies[1]):
+            raise ValueError(
+                'If topographies are passed in then they must be the same '
+                f'length. They are right now {len(topographies[0])} and '
+                f'{len(topographies[1])}.'
+            )
+        
+        group_names = ["seeds", "targets"]
+        for group_i, topographies_group in enumerate(topographies):
+            if len(topographies_group) != len(data):
+                raise ValueError(
+                    'If topographies are passed in then they must have the '
+                    f'same number of connections ({len(topographies_group)}) '
+                    f'as the connectivity data ({len(data)}).'
+                )
+            for con_i, topo_data in enumerate(topographies_group):
+                if self.indices is not None and topo_data.shape[0] != \
+                len(self.indices[group_i][con_i]):
+                    raise ValueError(
+                        'If topographies are passed in then the values for '
+                        'each connection must have the same number of entries '
+                        'as there are channels in the corresponding indices. '
+                        f'For the {group_names[group_i]}, connection {con_i}, '
+                        f'the topographies have {topo_data.shape[0]} entries, '
+                        'but the indices contain '
+                        f'{len(self.indices[group_i][con_i])} channels.'
+                    )
+                if topo_data.shape[1:] != data[con_i].shape:
+                    raise ValueError(
+                        'If topographies are passed in then the values for '
+                        'each channel of each connection must have the same '
+                        'dimensions as the connectivity data. For the '
+                        f'{group_names[group_i]}, connection {con_i}, the '
+                        f'topographies have shape {topo_data.shape[1:]}, but '
+                        'the connectivity data has dimensions '
+                        f'{data[con_i].shape}.'
+                    )
+
+    def _check_n_components_consistency(self, n_components):
+        """Perform n_components input checks."""
+        # useful for converting back to a tuple when re-loading after saving
+        if isinstance(n_components, list):
+            n_components = tuple(copy(n_components))
+
+        if not isinstance(n_components, tuple):
+            raise TypeError('n_components should be a tuple')
+
+        if len(n_components) != 2:
+            raise ValueError('n_components should be a tuple of two lists')
+
+        for group in n_components:
+            if not isinstance(group, list):
+                raise TypeError('n_components should contain two lists')
+
+        if len(n_components[0]) != len(n_components[1]):
+            raise ValueError(
+                'the seed and target portions of n_components must have an '
+                'equal length'
+            )
+
+    @property
+    def topographies(self):
+        """Connectivity topographies."""
+        return self.attrs['topographies']
+    
+    @property
+    def n_components(self):
+        """Number of components used for the SVD in the connectivity
+        computation."""
+        return self.attrs['n_components']
+
+    @property
+    def n_lags(self):
+        """Number of lags used when computing connectivity."""
+        return self.attrs['n_lags']
+
+    def save(self, fname):
+        """Save connectivity data to disk.
+
+        Parameters
+        ----------
+        fname : str | pathlib.Path
+            The filepath to save the data. Data is saved
+            as netCDF files (``.nc`` extension).
+        """
+        old_attrs = deepcopy(self.attrs)
+        self._pad_ragged_attrs()
+        self._replace_none_n_components()
+        super(BaseMultivariateConnectivity, self).save(fname)
+        self.xarray.attrs = old_attrs # resets to non-padded attrs
+
+    def _pad_ragged_attrs(self):
+        """Pads ragged attributes of the connectivity object (i.e. indices and
+        topographies) with np.inf until they are no longer ragged, at which
+        point they can be saved using HDF5."""
+        max_n_channels = self._get_max_n_channels()
+        self._pad_indices(max_n_channels)
+        if self.topographies is not None:
+            self._pad_topographies(max_n_channels)
+    
+    def _get_max_n_channels(self):
+        """Finds the highest number of channels involved in any one
+        connection."""
+        max_n_channels = 0
+        for group in self.indices:
+            for con in group:
+                if len(con) > max_n_channels:
+                    max_n_channels = len(con)
+        
+        return max_n_channels
+
+    def _pad_indices(self, max_n_channels):
+        """Pads indices for seeds and targets with np.inf until they are no
+        longer ragged (i.e. the length of indices for each connection equals
+        'max_n_channels')."""
+        padded_indices = [[], []]
+        for group_i, group in enumerate(self.indices):
+            for con_i, con in enumerate(group):
+                if np.count_nonzero(con == self._pad_val):
+                    # this would break the unpadding process when re-loading the
+                    # connectivity object
+                    raise ValueError(
+                        'the connectivity object cannot be saved with '
+                        f'{self._pad_val} in the indices, as index values '
+                        'should be ints'
+                    )
+                padded_indices[group_i].append(con)
+                len_diff = max_n_channels - len(con)
+                if len_diff != 0:
+                    padded_indices[group_i][con_i].extend(
+                        [self._pad_val for _ in range(len_diff)]
+                    )
+        
+        self.attrs['indices'] = tuple(padded_indices)
+    
+    def _pad_topographies(self, max_n_channels):
+        """Pads topographies for seeds and targets with np.inf until they are no
+        longer ragged (i.e. the length of the first dimension of topographies
+        for each connection equals 'max_n_channels')."""
+        topos_dims = [2, len(self.indices[0]), max_n_channels, len(self.freqs)]
+        if 'times' in self.coords:
+            topos_dims.append(len(self.times))
+        padded_topos = np.full(
+            topos_dims, self._pad_val, dtype=self.topographies[0][0].dtype
+        )
+
+        for group_i, group in enumerate(self.topographies):
+            for con_i, con in enumerate(group):
+                padded_topos[group_i][con_i][:con.shape[0]] = con
+                    
+        self.attrs['topographies'] = padded_topos
+
+    def _replace_none_n_components(self):
+        """Replace None values in the n_components attribute with 'n/a', since
+        None is not supported by netCDF."""
+        n_components = [[], []]
+        for group_i, group in enumerate(self.attrs['n_components']):
+            for con in group:
+                if con is None:
+                    n_components[group_i].append('n/a')
+                else:
+                    n_components[group_i].apend(con)
+        self.attrs['n_components'] = tuple(n_components)
+
+    def _restore_attrs(self):
+        """Unpads ragged attributes of the connectivity object (i.e. indices and
+        topographies) padded with np.inf and restored nested None values in
+        attributes replaced with 'n/a' so that they could be saved using
+        HDF5."""
+        n_padded_channels = self._get_n_padded_channels()
+        self._unpad_indices(n_padded_channels)
+        if self.topographies is not None:
+            self._unpad_topographies(n_padded_channels)
+        
+        self._restore_non_n_components()
+
+    def _get_n_padded_channels(self):
+        """Finds the number of channels that have been added when padding the
+        seed and target indices and topographies based on the number of padded
+        entries (np.inf) in each connection."""
+        n_padded_channels = np.zeros((2, len(self.indices[0])), dtype=np.int32)
+        for group_i, group in enumerate(self.indices):
+            for con_i, con in enumerate(group):
+                n_padded_channels[group_i][con_i] = np.count_nonzero(
+                    con == self._pad_val
+                )
+        
+        return n_padded_channels
+    
+    def _unpad_indices(self, n_padded_channels):
+        """Removes entries in the indices for each connection added when the
+        indices were padded with np.inf before saving."""
+        unpadded_indices = [[], []]
+        for group_i, group in enumerate(self.indices):
+            for con_i, con in enumerate(group):
+                if n_padded_channels[group_i][con_i] != 0:
+                    unpadded_con = con[:-n_padded_channels[group_i][con_i]]
+                else:
+                    unpadded_con = con
+                unpadded_indices[group_i].append(
+                    [int(idx) for idx in unpadded_con]
+                )
+        
+        self.attrs['indices'] = tuple(unpadded_indices)
+    
+    def _unpad_topographies(self, n_padded_channels):
+        """Removes entries in the topographies for each connection added when
+        the topographies were padded with np.inf before saving."""
+        unpadded_topos = np.empty((2, len(self.indices[0])), dtype=object)
+        for group_i, group in enumerate(self.topographies):
+            for con_i, con in enumerate(group):
+                if n_padded_channels[group_i][con_i] != 0:
+                    unpadded_topos[group_i][con_i] = con[
+                        :-n_padded_channels[group_i][con_i]
+                    ]
+                else:
+                    unpadded_topos[group_i][con_i] = con
+        
+        self.attrs['topographies'] = unpadded_topos
+
+    def _restore_non_n_components(self):
+        """Restores None values in the n_components attribute with from
+        'n/a'."""
+        n_components = [[], []]
+        for group_i, group in enumerate(self.attrs['n_components']):
+            for con in group:
+                if con == 'n/a':
+                    n_components[group_i].append(None)
+                else:
+                    n_components[group_i].apend(con)
+        self.attrs['n_components'] = tuple(n_components)
+
+
+class MultivariateSpectralConnectivity(
+    SpectralConnectivity, BaseMultivariateConnectivity
+):
+    """Multivariate spectral connectivity class.
+
+    This class stores multivariate connectivity data that varies over
+    frequencies. The underlying data is an array of shape (n_connections,
+    n_freqs).
+
+    Parameters
+    ----------
+    %(data)s
+    %(freqs)s
+    %(n_nodes)s
+    %(names)s
+    %(indices)s
+    %(method)s
+    %(spec_method)s
+    %(n_epochs_used)s
+    %(connectivity_kwargs)s
+
+    See Also
+    --------
+    mne_connectivity.multivariate_spectral_connectivity_epochs
+    """
+
+    def __init__(
+        self, data, freqs, n_nodes, names=None, indices=None, method=None,
+        spec_method=None, n_epochs_used=None, topographies=None,
+        n_components=None, n_lags=None, **kwargs
+    ):
+        super(MultivariateSpectralConnectivity, self).__init__(
+            data=data, names=names, method=method, indices=indices,
+            n_nodes=n_nodes, freqs=freqs, spec_method=spec_method,
+            n_epochs_used=n_epochs_used, **kwargs
+        )
+        super(MultivariateSpectralConnectivity, self)._add_multivariate_attrs(
+            topographies=topographies, n_components=n_components, n_lags=n_lags
+        )
+
+
+class MultivariateSpectroTemporalConnectivity(
+    SpectroTemporalConnectivity, BaseMultivariateConnectivity
+):
+    """Multivariate spectrotemporal connectivity class.
+
+    This class stores multivariate connectivity data that varies over both
+    frequency and time. The temporal part describes sample-by-sample
+    time-varying connectivity (usually on the order of milliseconds). Note the
+    difference relative to Epochs.
+
+    The underlying data is an array of shape (n_connections, n_freqs, n_times).
+
+    Parameters
+    ----------
+    %(data)s
+    %(freqs)s
+    %(times)s
+    %(n_nodes)s
+    %(names)s
+    %(indices)s
+    %(method)s
+    %(spec_method)s
+    %(n_epochs_used)s
+    %(connectivity_kwargs)s
+
+    See Also
+    --------
+    mne_connectivity.multivariate_spectral_connectivity_epochs
+    """
+
+    def __init__(
+        self, data, freqs, n_nodes, names=None, indices=None, method=None,
+        spec_method=None, times=None, n_epochs_used=None, topographies=None,
+        n_components=None, n_lags=None, **kwargs
+    ):
+        super(MultivariateSpectroTemporalConnectivity, self).__init__(
+            data=data, names=names, method=method, indices=indices,
+            n_nodes=n_nodes, freqs=freqs, spec_method=spec_method, times=times,
+            n_epochs_used=n_epochs_used, **kwargs
+        )
+        super(
+            MultivariateSpectroTemporalConnectivity, self
+        )._add_multivariate_attrs(
+            topographies=topographies, n_components=n_components, n_lags=n_lags
+        )
+        
 
 
 @fill_doc

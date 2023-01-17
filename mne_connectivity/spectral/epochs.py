@@ -16,7 +16,8 @@ from mne.time_frequency.multitaper import (_csd_from_mt,
                                            _psd_from_mt_adaptive)
 from mne.time_frequency.tfr import cwt, morlet
 from mne.time_frequency.multitaper import _compute_mt_params
-from mne.utils import (_arange_div, _check_option, logger, warn, _time_mask)
+from mne.utils import (_arange_div, _check_option, logger, warn, _time_mask,
+                       verbose)
 
 from .epochs_classes import (_AbstractConEstBase, _CohEst, _CohyEst, _ImCohEst,
                             _PLVEst, _ciPLVEst, _PPCEst, _PLIEst,
@@ -209,7 +210,8 @@ def _epoch_spectral_connectivity(data, sig_idx, tmin_idx, tmax_idx, sfreq,
                                  mode, window_fun, eigvals, wavelets,
                                  freq_mask, mt_adaptive, idx_map, block_size,
                                  psd, accumulate_psd, con_method_types,
-                                 con_methods, n_signals, n_times, gc_n_lags,
+                                 con_methods, n_signals, n_times,
+                                 use_n_signals=None, gc_n_lags=None,
                                  accumulate_inplace=True):
     """Estimate connectivity for one epoch (see spectral_connectivity)."""
     n_cons = len(idx_map[0])
@@ -221,22 +223,23 @@ def _epoch_spectral_connectivity(data, sig_idx, tmin_idx, tmax_idx, sfreq,
         n_times_spectrum = 0
         n_freqs = np.sum(freq_mask)
 
-    n_signals = len(np.unique(idx_map[0]))
-
     if not accumulate_inplace:
         # instantiate methods only for this epoch (used in parallel mode)
         con_methods = []
         for mtype in con_method_types:
             method_params = list(inspect.signature(mtype).parameters)
             if "n_signals" in method_params:
+                # if it's a multivariate connectivoty method
                 if "n_lags" in method_params:
+                    # if it's a Granger causality method
                     con_methods.append(
-                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum,
+                        mtype(use_n_signals, n_cons, n_freqs, n_times_spectrum,
                               gc_n_lags)
                     )
                 else:
+                    # if it's a coherence method
                     con_methods.append(
-                        mtype(n_signals, n_cons, n_freqs, n_times_spectrum)
+                        mtype(use_n_signals, n_cons, n_freqs, n_times_spectrum)
                     )
             else:
                 con_methods.append(mtype(n_cons, n_freqs, n_times_spectrum))
@@ -418,9 +421,10 @@ _CON_METHOD_MAP = {'coh': _CohEst, 'cohy': _CohyEst, 'imcoh': _ImCohEst,
                    'plv': _PLVEst, 'ciplv': _ciPLVEst, 'ppc': _PPCEst,
                    'pli': _PLIEst, 'pli2_unbiased': _PLIUnbiasedEst,
                    'dpli': _DPLIEst, 'wpli': _WPLIEst,
-                   'wpli2_debiased': _WPLIDebiasedEst, 'mic': _MICEst,
-                   'mim': _MIMEst, 'gc': _GCEst, 'net_gc': _NetGCEst,
-                   'trgc': _TRGCEst, 'net_trgc': _NetTRGCEst}
+                   'wpli2_debiased': _WPLIDebiasedEst,
+                   'mic': _MICEst, 'mim': _MIMEst, 'gc': _GCEst,
+                   'net_gc': _NetGCEst, 'trgc': _TRGCEst,
+                   'net_trgc': _NetTRGCEst}
 
 
 def _check_estimators(method, mode):
@@ -451,6 +455,7 @@ def _check_estimators(method, mode):
     return con_method_types, n_methods, accumulate_psd, n_comp_args
 
 
+@verbose
 @fill_doc
 def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
                                  sfreq=2 * np.pi,
@@ -521,8 +526,8 @@ def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
         Use adaptive weights to combine the tapered spectra into PSD.
         Only used in 'multitaper' mode.
     mt_low_bias : bool
-        Only use tapers with more than 90%% spectral concentration within
-        bandwidth. Only used in 'multitaper' mode.
+        Only use tapers with more than 90 percent spectral concentration
+        within bandwidth. Only used in 'multitaper' mode.
     cwt_freqs : array
         Array of frequencies of interest. Only used in 'cwt_morlet' mode.
     cwt_n_cycles : float | array of float
@@ -550,6 +555,7 @@ def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
 
     See Also
     --------
+    mne_connectivity.spectral_connectivity_time
     mne_connectivity.SpectralConnectivity
     mne_connectivity.SpectroTemporalConnectivity
 
@@ -564,7 +570,9 @@ def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
     connectivity structure. Within each Epoch, it is assumed that the spectral
     measure is stationary. The spectral measures implemented in this function
     are computed across Epochs. **Thus, spectral measures computed with only
-    one Epoch will result in errorful values.**
+    one Epoch will result in errorful values and spectral measures computed
+    with few Epochs will be unreliable.** Please see
+    ``spectral_connectivity_time`` for time-resolved connectivity estimation.
 
     The spectral densities can be estimated using a multitaper method with
     digital prolate spheroidal sequence (DPSS) windows, a discrete Fourier
@@ -582,11 +590,11 @@ def spectral_connectivity_epochs(data, names=None, method='coh', indices=None,
         indices = (np.array([0, 0, 0]),    # row indices
                    np.array([2, 3, 4]))    # col indices
 
-        con_flat = spectral_connectivity(data, method='coh',
-                                         indices=indices, ...)
+        con = spectral_connectivity_epochs(data, method='coh',
+                                           indices=indices, ...)
 
-    In this case con_flat.shape = (3, n_freqs). The connectivity scores are
-    in the same order as defined indices.
+    In this case con.get_data().shape = (3, n_freqs). The connectivity scores
+    are in the same order as defined indices.
 
     **Supported Connectivity Measures**
 
