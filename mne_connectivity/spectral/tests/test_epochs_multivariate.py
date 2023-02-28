@@ -573,16 +573,6 @@ class TestMultivarSpectralConnectivity:
         # Add checks that performing faverage in function call matches manual
         # result, and that same is seen for MIC topographies
 
-        # multivariate_spectral_connectivity_epochs(
-        #     self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
-        #     fmin=(3, 8, 15), fmax=(7, 14, 20), faverage=True, method="mic"
-        #     )
-
-        multivariate_spectral_connectivity_epochs(
-            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
-            fmin=(3, 8, 15), fmax=(7, 14, 20), faverage=True, method="gc"
-            )
-
         fmin = (3, 8, 15)
         fmax = (7, 14, 20)
         cwt_freqs = None    # default
@@ -597,6 +587,16 @@ class TestMultivarSpectralConnectivity:
                     self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
                     faverage=False, method="mic", cwt_freqs=cwt_freqs, mode=mode
                     )
+        
+        con1_gc = multivariate_spectral_connectivity_epochs(
+            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+            fmin=fmin, fmax=fmax, faverage=True, method="gc"
+            )
+
+        con2_gc = multivariate_spectral_connectivity_epochs(
+            self.test_data, indices=([[0,2]], [[1,3]]), sfreq=self.sfreq,
+            faverage=False, method="gc"
+            )
 
         freqs1 = con1_mic.attrs.get('freqs_used')
         freqs2 = con2_mic.attrs.get('freqs_used')
@@ -605,6 +605,8 @@ class TestMultivarSpectralConnectivity:
         fskip = 0
         cwt_freqs = None     # default used for con1/con2
         mode = "multitaper"  # default used for con1/con2
+
+        # test for mic
         for i in range(len(freqs1)):
             # now we want to get the frequency indices
             # create a frequency mask for all bands
@@ -619,9 +621,26 @@ class TestMultivarSpectralConnectivity:
                 freqs, [fmin[i]], [fmax[i]], fskip)
             freqs = freqs[freq_mask]
             freqs_idx = np.searchsorted(freqs2, freqs)
-            con2_avg = np.mean(con2_mic.get_data()[:, freqs_idx], axis=1)
-            assert_array_almost_equal(con2_avg, con1_mic.get_data()[:, i])
+            con2_mic_avg = np.mean(con2_mic.get_data()[:, freqs_idx], axis=1)
+            assert_array_almost_equal(con2_mic_avg, con1_mic.get_data()[:, i])
 
+        # test for gc
+        for i in range(len(freqs1)):
+            # now we want to get the frequency indices
+            # create a frequency mask for all bands
+            n_times = len(con2_gc.attrs.get('times_used'))
+
+            # compute frequencies to analyze based on number of samples,
+            # sampling rate, specified wavelet frequencies and mode
+            freqs = _compute_freqs(n_times, self.sfreq, cwt_freqs, mode)
+
+            # compute the mask based on specified min/max and decim factor
+            freq_mask = _compute_freq_mask(
+                freqs, [fmin[i]], [fmax[i]], fskip)
+            freqs = freqs[freq_mask]
+            freqs_idx = np.searchsorted(freqs2, freqs)
+            con2_gc_avg = np.mean(con2_gc.get_data()[:, freqs_idx], axis=1)
+            assert_array_almost_equal(con2_gc_avg, con1_gc.get_data()[:, i])
 
     def test_check_for_discontinuous_freqs(self):
         # cwt_freqs is a discontinuous array
