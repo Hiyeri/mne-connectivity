@@ -579,7 +579,7 @@ class TestMultivarSpectralConnectivity:
 
         # Add checks that performing faverage in function call matches manual
         # result, and that same is seen for MIC topographies
-
+        
 
     def test_check_for_discontinuous_freqs(self):
         # cwt_freqs is a discontinuous array
